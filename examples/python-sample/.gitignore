@@ -1,0 +1,3 @@
+# Ignore vendored dependencies for analysis.
+vendor/
+__pycache__/

@@ -1,0 +1,13 @@
+[package]
+name = "spectograph-py"
+description = "Spectograph Python analyzer: parse + resolve Python source into the shared IR."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+spectograph-core.workspace = true
+spectograph-analyzer.workspace = true
+tree-sitter = "0.25"
+tree-sitter-python = "0.23"

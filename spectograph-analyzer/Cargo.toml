@@ -1,0 +1,12 @@
+[package]
+name = "spectograph-analyzer"
+description = "Spectograph language analyzer trait and harness."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+spectograph-core.workspace = true
+ignore = "0.4"
+thiserror.workspace = true
