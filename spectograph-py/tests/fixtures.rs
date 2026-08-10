@@ -44,6 +44,35 @@ fn python_classes_fixture() {
     assert!(is_flagged(&report, "unused_method"), "unused_method is never called");
 }
 
+/// python-relative: relative imports resolve to the correct module. core.helper is
+/// reachable via `from .core import helper`; other.helper (same name, different module)
+/// stays dead.
+#[test]
+fn python_relative_fixture() {
+    let mut program = analyze("python-relative");
+    let report = report(&mut program);
+
+    // core.helper is imported and called -> reachable.
+    let core_helper = program
+        .symbols
+        .iter()
+        .find(|s| s.name == "helper" && s.file.to_string_lossy().ends_with("core.py"))
+        .expect("core helper");
+    assert!(core_helper.reachable, "core helper should be reachable via relative import");
+
+    // Dead symbols.
+    assert!(is_flagged(&report, "dead_core"), "dead_core is unused");
+    assert!(is_flagged(&report, "other"), "other/other is unused");
+
+    // There is exactly one `helper` finding: other.py's (core's is reachable).
+    let helper_findings: Vec<_> = report.findings.iter().filter(|f| f.name == "helper").collect();
+    assert_eq!(helper_findings.len(), 1, "only other.helper should be flagged");
+    assert!(
+        helper_findings[0].file.contains("other.py"),
+        "flagged helper should be in other.py, not core.py"
+    );
+}
+
 /// python-sample: helper is used; dead_function/UnusedClass/UsedClass are dead; the
 /// dead imports stay dead.
 #[test]

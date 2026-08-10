@@ -81,6 +81,24 @@ impl Analyzer for PythonAnalyzer {
             parsed.push((path.to_string_lossy().into_owned(), result));
         }
 
+        // Dotted module path -> module id, and (module id, name) -> symbol id.
+        let module_paths: HashMap<String, SymbolId> = program
+            .symbols
+            .iter()
+            .filter(|s| s.kind == SymbolKind::Module)
+            .filter_map(|s| module_path_of(&s.file, &program.root).map(|p| (p, s.id)))
+            .collect();
+        let mut name_in_module: HashMap<(SymbolId, String), SymbolId> = HashMap::new();
+        for (_path, result) in &parsed {
+            for sym in &result.symbols {
+                if sym.kind != SymbolKind::Module {
+                    name_in_module
+                        .entry((result.module_id, sym.name.clone()))
+                        .or_insert(sym.id);
+                }
+            }
+        }
+
         // Pass 2: resolve references. Already-symbol targets are used directly;
         // name targets (dynamic/reflection) resolve against the global index.
         for (_path, result) in &parsed {
@@ -100,7 +118,8 @@ impl Analyzer for PythonAnalyzer {
         }
 
         // Pass 3: link each import to the definition it re-exports, so reachability
-        // flows through imports to the actual code.
+        // flows through imports to the actual code. Prefer module-scoped resolution
+        // (handles relative imports correctly); fall back to the global name index.
         let import_ids: Vec<SymbolId> = program
             .symbols
             .iter()
@@ -110,7 +129,30 @@ impl Analyzer for PythonAnalyzer {
         for import_id in import_ids {
             let sym = program.symbol(import_id);
             let Some(sym) = sym else { continue };
-            if let Some(&def_id) = def_index.get(&sym.name) {
+
+            // Find this import's ImportDecl and the module that declared it.
+            let decl_info = parsed.iter().find_map(|(_p, r)| {
+                r.imports
+                    .iter()
+                    .find(|d| d.symbol_id == import_id)
+                    .map(|d| (r.module_id, d))
+            });
+
+            let def_id = match decl_info {
+                Some((importing_module, decl)) => {
+                    resolve_import_target(
+                        &module_paths,
+                        &name_in_module,
+                        &sym.name,
+                        importing_module,
+                        decl,
+                    )
+                    .or_else(|| def_index.get(&sym.name).copied())
+                }
+                None => def_index.get(&sym.name).copied(),
+            };
+
+            if let Some(def_id) = def_id {
                 if def_id != import_id {
                     program.references.push(Reference {
                         from: import_id,
@@ -195,13 +237,6 @@ impl Analyzer for PythonAnalyzer {
         // Resolve `module.path:function` to the module symbol and the function symbol.
         let scripts = scripts_from_pyproject(root)?;
         if !scripts.is_empty() {
-            // Map dotted module path -> module symbol id.
-            let module_paths: HashMap<String, SymbolId> = program
-                .symbols
-                .iter()
-                .filter(|s| s.kind == SymbolKind::Module)
-                .filter_map(|s| module_path_of(&s.file, &program.root).map(|p| (p, s.id)))
-                .collect();
             for ep in scripts {
                 if let Some(&module_id) = module_paths.get(&ep.module_path) {
                     if let Some(&func_id) = def_by_module.get(&(module_id, ep.function)) {
@@ -240,6 +275,61 @@ fn module_path_of(file: &Path, root: &Path) -> Option<String> {
         if let Some(ext) = last.rsplit_once('.') {
             *last = ext.0.to_string();
         }
+    }
+    if comps.is_empty() {
+        None
+    } else {
+        Some(comps.join("."))
+    }
+}
+
+/// Resolve an import to the symbol it re-exports, using module-scoped resolution.
+///
+/// `importing_module` is the module containing the import; `decl` carries its relative
+/// depth and dotted module path. The imported `name` is looked up within the resolved
+/// target module, so `from .util import helper` finds `helper` in `pkg.util`, not some
+/// other module's `helper`.
+fn resolve_import_target(
+    module_paths: &HashMap<String, SymbolId>,
+    name_in_module: &HashMap<(SymbolId, String), SymbolId>,
+    name: &str,
+    importing_module: SymbolId,
+    decl: &parse::ImportDecl,
+) -> Option<SymbolId> {
+    let importing_path = module_paths
+        .iter()
+        .find(|(_, &id)| id == importing_module)
+        .map(|(p, _)| p.clone())?;
+    let target = if decl.depth > 0 {
+        relative_target(&importing_path, decl.depth, &decl.module_path)?
+    } else {
+        decl.module_path.clone()
+    };
+    if target.is_empty() {
+        return None;
+    }
+    let target_module = module_paths.get(&target)?;
+    name_in_module.get(&(*target_module, name.to_string())).copied()
+}
+
+/// Compute the dotted module path a relative import refers to.
+///
+/// `importing` is the importing module's full dotted path (e.g. `pkg.sub.mod`).
+/// Its package is all but the last component. `depth` dots climb up from that package:
+/// `depth == 1` stays in the package, `2` goes up one, etc. The `module_path` suffix is
+/// appended (empty for `from . import x`).
+fn relative_target(importing: &str, depth: usize, module_path: &str) -> Option<String> {
+    let mut comps: Vec<&str> = importing.split('.').collect();
+    // Drop the module's own file component -> the containing package.
+    comps.pop()?;
+    // Climb up (depth - 1) more levels.
+    let up = depth.saturating_sub(1);
+    if comps.len() < up {
+        return None;
+    }
+    comps.truncate(comps.len() - up);
+    for part in module_path.split('.').filter(|s| !s.is_empty()) {
+        comps.push(part);
     }
     if comps.is_empty() {
         None

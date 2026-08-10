@@ -69,6 +69,19 @@ pub struct FileResult {
     pub refs: Vec<UnresolvedRef>,
     /// Names declared public via `__all__`.
     pub exports: Vec<ExportDecl>,
+    /// Import declarations with their source-module info (for relative resolution).
+    pub imports: Vec<ImportDecl>,
+}
+
+/// A single import statement's source-module metadata, used to resolve the module the
+/// imported name comes from (especially for relative imports).
+pub struct ImportDecl {
+    /// Symbol id of the created Import symbol.
+    pub symbol_id: SymbolId,
+    /// Relative depth: 0 for absolute, 1 for `.`, 2 for `..`, etc.
+    pub depth: usize,
+    /// Dotted module path (empty for `from . import x` with no explicit module).
+    pub module_path: String,
 }
 
 /// A single name declared in a module's `__all__`.
@@ -134,6 +147,7 @@ pub fn parse_file(
     let mut symbols = Vec::new();
     let mut refs = Vec::new();
     let mut exports = Vec::new();
+    let mut imports = Vec::new();
     // class id -> (method name -> method symbol id), for `self.method()` resolution.
     let mut class_methods: HashMap<SymbolId, HashMap<String, SymbolId>> = HashMap::new();
 
@@ -146,10 +160,10 @@ pub fn parse_file(
     );
     symbols.push(module);
 
-    collect_globals(root, path, src, module_id, next_id, &mut symbols, &mut scopes, &mut exports, &mut class_methods);
+    collect_globals(root, path, src, module_id, next_id, &mut symbols, &mut scopes, &mut exports, &mut class_methods, &mut imports);
     collect_refs(root, src, module_id, &mut scopes, &mut refs, &class_methods);
 
-    FileResult { module_id, symbols, refs, exports }
+    FileResult { module_id, symbols, refs, exports, imports }
 }
 
 /// Extract the imported name and its alias from an import clause node.
@@ -172,6 +186,31 @@ fn import_name_and_alias(node: Node, src: &[u8]) -> (String, String) {
     }
 }
 
+/// Determine the source module of an `import_from_statement`: its relative depth and
+/// dotted module path.
+///
+/// - `from x import y`      -> (0, "x")
+/// - `from .sub import y`   -> (1, "sub")
+/// - `from .. import y`     -> (2, "")
+fn import_source(node: Node, src: &[u8]) -> (usize, String) {
+    // Look for a relative_import child: `from .sub import y`.
+    let mut c = node.walk();
+    for n in node.named_children(&mut c) {
+        if n.kind() == "relative_import" {
+            let text = node_text(n, src);
+            let dots = text.chars().take_while(|ch| *ch == '.').count();
+            let path = text[dots..].to_string();
+            return (dots, path);
+        }
+    }
+    // Absolute: `from x import y`.
+    let path = node
+        .child_by_field_name("module_name")
+        .map(|m| node_text(m, src).to_string())
+        .unwrap_or_default();
+    (0, path)
+}
+
 /// Walk top-level statements, defining module-level symbols and global bindings.
 #[allow(clippy::too_many_arguments)]
 fn collect_globals(
@@ -184,6 +223,7 @@ fn collect_globals(
     scopes: &mut Scopes,
     exports: &mut Vec<ExportDecl>,
     class_methods: &mut HashMap<SymbolId, HashMap<String, SymbolId>>,
+    imports: &mut Vec<ImportDecl>,
 ) {
     let mut cursor = root.walk();
     for child in root.named_children(&mut cursor) {
@@ -266,25 +306,34 @@ fn collect_globals(
                     let bound = if alias.is_empty() { &sym_name } else { &alias };
                     scopes.declare(bound, Binding::Global(id));
                     symbols.push(symbol(id, &sym_name, SymbolKind::Import, path, clause));
+                    // Absolute import: depth 0, module path is the dotted name.
+                    imports.push(ImportDecl {
+                        symbol_id: id,
+                        depth: 0,
+                        module_path: sym_name.clone(),
+                    });
                 }
             }
             "import_from_statement" => {
+                let (depth, src_module) = import_source(child, src.as_bytes());
                 let module = child.child_by_field_name("module_name");
                 let mut c2 = child.walk();
                 for clause in child.named_children(&mut c2) {
-                    // Star import: bind the module name as uncertain.
-                    if clause.kind() == "wildcard_import" {
-                        if let Some(m) = module {
-                            let mn = node_text(m, src.as_bytes()).to_string();
-                            scopes.declare(&mn, Binding::Dynamic);
-                        }
+                    // Skip the relative_import node and the module's own dotted name.
+                    if clause.kind() == "relative_import" {
                         continue;
                     }
-                    // Skip the module dotted_name itself; only bind imported names.
                     if let Some(m) = module {
                         if clause == m {
                             continue;
                         }
+                    }
+                    // Star import: bind the module name as uncertain.
+                    if clause.kind() == "wildcard_import" {
+                        if !src_module.is_empty() {
+                            scopes.declare(&src_module, Binding::Dynamic);
+                        }
+                        continue;
                     }
                     let (sym_name, alias) = import_name_and_alias(clause, src.as_bytes());
                     if sym_name.is_empty() {
@@ -295,6 +344,11 @@ fn collect_globals(
                     let bound = if alias.is_empty() { &sym_name } else { &alias };
                     scopes.declare(bound, Binding::Global(id));
                     symbols.push(symbol(id, &sym_name, SymbolKind::Import, path, clause));
+                    imports.push(ImportDecl {
+                        symbol_id: id,
+                        depth,
+                        module_path: src_module.clone(),
+                    });
                 }
             }
             // `__all__ = ["a", "b"]` declares the module's public API.
