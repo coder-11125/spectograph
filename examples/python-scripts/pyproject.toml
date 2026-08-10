@@ -1,0 +1,9 @@
+[project]
+name = "specto-cli"
+version = "0.1.0"
+
+[project.scripts]
+specto-cli = "spectocli.cli:run"
+
+[project.gui-scripts]
+specto-gui = "spectocli.gui:main"

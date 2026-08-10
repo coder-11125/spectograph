@@ -11,6 +11,7 @@ spectograph-core.workspace = true
 spectograph-analyzer.workspace = true
 tree-sitter = "0.25"
 tree-sitter-python = "0.23"
+toml = "0.8"
 
 [dev-dependencies]
 tempfile = "3"

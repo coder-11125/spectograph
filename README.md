@@ -16,7 +16,8 @@ Implemented:
 - Cargo workspace with `core`, `analyzer`, `cli`, `py` crates.
 - Language-agnostic IR: symbols, references (with uncertainty), entrypoints, exports.
 - Cost/usage model and tiered bloat classification.
-- Reachability from entrypoints (respecting `__main__` guards).
+- Reachability from entrypoints (`__main__` guards, `__init__.py` package roots, and
+  `pyproject.toml` `[project.scripts]` / `[project.gui-scripts]` console scripts).
 - Python resolution: scope/shadowing, import aliasing, dynamic constructs marked
   uncertain (star imports, `getattr`, `__import__`).
 - Package handling: `__init__.py` re-exports as package roots, and `__all__` names as

@@ -2,11 +2,13 @@
 //!
 //! Parses Python source with tree-sitter into the shared [`Program`] IR.
 
+pub mod entrypoints;
 pub mod parse;
 
 use std::collections::HashMap;
 use std::path::Path;
 
+use entrypoints::scripts_from_pyproject;
 use parse::parse_file;
 use spectograph_analyzer::{Analyzer, AnalyzeError, discover};
 use spectograph_core::ir::{
@@ -41,6 +43,8 @@ impl Analyzer for PythonAnalyzer {
         let mut global_names: HashMap<String, SymbolId> = HashMap::new();
         // Definition index (Function/Class) by name, for import re-export linking.
         let mut def_index: HashMap<String, SymbolId> = HashMap::new();
+        // Function/Class index scoped by (module_id, name) for entrypoint resolution.
+        let mut def_by_module: HashMap<(SymbolId, String), SymbolId> = HashMap::new();
         // Track each file's module id and whether it contains an entrypoint.
         let mut file_entry: HashMap<String, bool> = HashMap::new();
 
@@ -67,6 +71,9 @@ impl Analyzer for PythonAnalyzer {
                             | spectograph_core::ir::SymbolKind::Class
                     ) {
                         def_index.entry(sym.name.clone()).or_insert(sym.id);
+                        def_by_module
+                            .entry((module_id, sym.name.clone()))
+                            .or_insert(sym.id);
                     }
                 }
             }
@@ -184,6 +191,59 @@ impl Analyzer for PythonAnalyzer {
             }
         }
 
+        // Console-script entrypoints from pyproject.toml `[project.scripts]`.
+        // Resolve `module.path:function` to the module symbol and the function symbol.
+        let scripts = scripts_from_pyproject(root)?;
+        if !scripts.is_empty() {
+            // Map dotted module path -> module symbol id.
+            let module_paths: HashMap<String, SymbolId> = program
+                .symbols
+                .iter()
+                .filter(|s| s.kind == SymbolKind::Module)
+                .filter_map(|s| module_path_of(&s.file, &program.root).map(|p| (p, s.id)))
+                .collect();
+            for ep in scripts {
+                if let Some(&module_id) = module_paths.get(&ep.module_path) {
+                    if let Some(&func_id) = def_by_module.get(&(module_id, ep.function)) {
+                        if !program.entrypoints.contains(&func_id) {
+                            program.entrypoints.push(func_id);
+                        }
+                    }
+                }
+            }
+        }
+
         Ok(program)
+    }
+}
+
+/// Compute a file's dotted module path relative to `root`.
+///
+/// - `pkg/mod.py`       -> `pkg.mod`
+/// - `pkg/mod/__init__.py` -> `pkg.mod`
+fn module_path_of(file: &Path, root: &Path) -> Option<String> {
+    let rel = file.strip_prefix(root).unwrap_or(file);
+    let mut comps: Vec<String> = rel
+        .components()
+        .filter_map(|c| match c {
+            std::path::Component::Normal(s) => Some(s.to_string_lossy().into_owned()),
+            _ => None,
+        })
+        .collect();
+    if comps.is_empty() {
+        return None;
+    }
+    let is_init = comps.last().map(|s| s == "__init__.py").unwrap_or(false);
+    if is_init {
+        comps.pop();
+    } else if let Some(last) = comps.last_mut() {
+        if let Some(ext) = last.rsplit_once('.') {
+            *last = ext.0.to_string();
+        }
+    }
+    if comps.is_empty() {
+        None
+    } else {
+        Some(comps.join("."))
     }
 }
