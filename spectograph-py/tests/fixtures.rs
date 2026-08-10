@@ -28,6 +28,22 @@ fn is_flagged(report: &analysis::Report, name: &str) -> bool {
     report.findings.iter().any(|f| f.name == name)
 }
 
+/// python-classes: methods resolve via self.method() and obj.method(); constructor
+/// __init__ is used; unused_method is dead.
+#[test]
+fn python_classes_fixture() {
+    let mut program = analyze("python-classes");
+    let report = report(&mut program);
+
+    // Used methods + constructor.
+    assert!(!is_flagged(&report, "greet"), "greet called via g.greet()");
+    assert!(!is_flagged(&report, "_make_greeting"), "reached via self._make_greeting()");
+    assert!(!is_flagged(&report, "__init__"), "constructor used when class instantiated");
+
+    // Dead method.
+    assert!(is_flagged(&report, "unused_method"), "unused_method is never called");
+}
+
 /// python-sample: helper is used; dead_function/UnusedClass/UsedClass are dead; the
 /// dead imports stay dead.
 #[test]

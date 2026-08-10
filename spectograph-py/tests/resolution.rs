@@ -128,6 +128,51 @@ fn star_import_is_uncertain_not_false_static() {
     assert!(!anything.reachable, "star-imported symbol must not be statically reachable");
 }
 
+/// A method called only via `self.method()` inside another method stays reachable.
+#[test]
+fn self_method_call_keeps_method_reachable() {
+    let mut program = analyze(&[(
+        "main.py",
+        concat!(
+            "class A:\n",
+            "    def run(self):\n",
+            "        return self.step()\n",
+            "    def step(self):\n",
+            "        return 1\n",
+            "    def dead(self):\n",
+            "        return 2\n",
+            "def main():\n",
+            "    return A().run()\n",
+            "if __name__ == '__main__':\n",
+            "    main()\n",
+        ),
+    )]);
+    let report = report(&mut program);
+    assert!(find(&report, "run").is_none(), "run should be reachable");
+    assert!(find(&report, "step").is_none(), "step via self.step() should be reachable");
+    assert!(find(&report, "dead").is_some(), "dead method should be bloat");
+}
+
+/// A method called only via `obj.method()` where obj is a local instance is reachable.
+#[test]
+fn obj_method_call_keeps_method_reachable() {
+    let mut program = analyze(&[(
+        "main.py",
+        concat!(
+            "class B:\n",
+            "    def handle(self):\n",
+            "        return 1\n",
+            "def main():\n",
+            "    b = B()\n",
+            "    return b.handle()\n",
+            "if __name__ == '__main__':\n",
+            "    main()\n",
+        ),
+    )]);
+    let report = report(&mut program);
+    assert!(find(&report, "handle").is_none(), "handle via b.handle() should be reachable");
+}
+
 /// Cross-file usage through a plain module import must keep the target reachable.
 #[test]
 fn cross_file_import_keeps_target_reachable() {
