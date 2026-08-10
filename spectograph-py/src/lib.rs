@@ -72,14 +72,19 @@ impl Analyzer for PythonAnalyzer {
             parsed.push((path.to_string_lossy().into_owned(), result));
         }
 
-        // Pass 2: resolve references against the global name index.
+        // Pass 2: resolve references. Already-symbol targets are used directly;
+        // name targets (dynamic/reflection) resolve against the global index.
         for (_path, result) in &parsed {
-            for (from, name, kind) in &result.refs {
-                if let Some(&to) = global_names.get(name) {
+            for r in &result.refs {
+                let to = match &r.target {
+                    parse::RefTarget::Symbol(id) => Some(*id),
+                    parse::RefTarget::Name(name) => global_names.get(name).copied(),
+                };
+                if let Some(to) = to {
                     program.references.push(Reference {
-                        from: *from,
+                        from: r.from,
                         to,
-                        kind: *kind,
+                        kind: r.kind,
                     });
                 }
             }

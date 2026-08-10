@@ -14,7 +14,7 @@ pub fn discover_files(root: &Path, language: Language) -> std::io::Result<Vec<Pa
 
     for entry in walker {
         let entry = entry.map_err(|e| {
-            std::io::Error::new(std::io::ErrorKind::Other, format!("walk error: {e}"))
+            std::io::Error::other(format!("walk error: {e}"))
         })?;
         if !entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
             continue;

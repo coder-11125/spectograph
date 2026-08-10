@@ -1,4 +1,13 @@
 //! Single-file Python parsing: extract symbols and references from one source file.
+//!
+//! Resolution model:
+//! - A [`Scopes`] stack tracks name bindings (globals, locals, and dynamic/uncertain).
+//! - Phase 1 (`collect_globals`) registers module-level functions, classes, and imports.
+//! - Phase 2 (`collect_refs`) walks the tree, pushing scopes for function/class bodies,
+//!   binding parameters and assignments as locals, and emitting references from the
+//!   enclosing symbol to whatever a name resolves to.
+//! - Uncertain constructs (`from x import *`, `getattr`, `__import__`) are marked
+//!   [`RefKind::Reflection`]/[`RefKind::Dynamic`] rather than silently assumed.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -6,11 +15,48 @@ use std::path::Path;
 use spectograph_core::ir::{RefKind, SourceSpan, Symbol, SymbolId, SymbolKind};
 use tree_sitter::{Node, Parser};
 
-/// The scope of names defined/imported at the top level of one file.
+/// How a name resolves.
+#[derive(Clone, Copy, PartialEq)]
+enum Binding {
+    /// A module-level symbol (function/class/import) this name refers to.
+    Global(SymbolId),
+    /// A local variable / parameter / assignment, shadowing any outer binding.
+    Local,
+    /// An uncertain binding (e.g. star import), resolvable only dynamically.
+    Dynamic,
+}
+
+/// A stack of lexical scopes. Scope 0 is the module/global scope.
 #[derive(Default)]
-struct FileScope {
-    /// name -> SymbolId of the global symbol it refers to.
-    names: HashMap<String, SymbolId>,
+struct Scopes {
+    stack: Vec<HashMap<String, Binding>>,
+}
+
+impl Scopes {
+    fn new() -> Self {
+        let mut s = Self { stack: Vec::new() };
+        s.push();
+        s
+    }
+    fn push(&mut self) {
+        self.stack.push(HashMap::new());
+    }
+    fn pop(&mut self) {
+        self.stack.pop();
+    }
+    fn declare(&mut self, name: &str, binding: Binding) {
+        if let Some(top) = self.stack.last_mut() {
+            top.insert(name.to_string(), binding);
+        }
+    }
+    fn resolve(&self, name: &str) -> Option<Binding> {
+        for scope in self.stack.iter().rev() {
+            if let Some(b) = scope.get(name) {
+                return Some(*b);
+            }
+        }
+        None
+    }
 }
 
 /// Result of parsing a single file: its symbols and internal references.
@@ -20,7 +66,23 @@ pub struct FileResult {
     pub symbols: Vec<Symbol>,
     /// References whose `from` is a symbol in this file and `to` may be any file
     /// (resolved later once all modules are known).
-    pub refs: Vec<(SymbolId, String, RefKind)>,
+    pub refs: Vec<UnresolvedRef>,
+}
+
+/// The target of a reference discovered during single-file parsing.
+pub enum RefTarget {
+    /// A resolved symbol (functions/classes/imports referenced by name).
+    Symbol(SymbolId),
+    /// An unresolved dynamic/reflection target (e.g. a string from `getattr`/`__import__`),
+    /// resolved against the global symbol index after all files are parsed.
+    Name(String),
+}
+
+/// A reference with its target possibly still unresolved across files.
+pub struct UnresolvedRef {
+    pub from: SymbolId,
+    pub target: RefTarget,
+    pub kind: RefKind,
 }
 
 fn node_text<'a>(node: Node, src: &'a [u8]) -> &'a str {
@@ -32,6 +94,17 @@ fn span(node: Node) -> SourceSpan {
     let s = node.start_position();
     let e = node.end_position();
     SourceSpan::new(s.row + 1, s.column + 1, e.row + 1, e.column + 1)
+}
+
+fn symbol(id: SymbolId, name: &str, kind: SymbolKind, path: &Path, node: Node) -> Symbol {
+    Symbol {
+        id,
+        name: name.to_string(),
+        kind,
+        file: path.to_path_buf(),
+        span: span(node),
+        reachable: false,
+    }
 }
 
 /// Parse a single Python file. `module_id` is assigned by the caller.
@@ -48,28 +121,47 @@ pub fn parse_file(
     let tree = parser.parse(src, None).expect("parse python");
     let root = tree.root_node();
 
-    let mut scope = FileScope::default();
+    let mut scopes = Scopes::new();
     let mut symbols = Vec::new();
     let mut refs = Vec::new();
 
-    // Module symbol for the file itself.
-    let module = Symbol {
-        id: module_id,
-        name: path.to_string_lossy().into_owned(),
-        kind: SymbolKind::Module,
-        file: path.to_path_buf(),
-        span: span(root),
-        reachable: false,
-    };
+    let module = symbol(
+        module_id,
+        &path.to_string_lossy(),
+        SymbolKind::Module,
+        path,
+        root,
+    );
     symbols.push(module);
 
-    collect_globals(root, path, src, module_id, next_id, &mut symbols, &mut scope);
-    collect_references(root, src, module_id, &scope, &mut refs);
+    collect_globals(root, path, src, module_id, next_id, &mut symbols, &mut scopes);
+    collect_refs(root, src, module_id, &mut scopes, &mut refs);
 
     FileResult { module_id, symbols, refs }
 }
 
-/// Walk top-level statements, defining global symbols (imports, defs, classes).
+/// Extract the imported name and its alias from an import clause node.
+///
+/// - `import x` / `from x import y`  -> `(x|y, "")`
+/// - `import x as y` / `from x import y as z` -> `(x|y, "y"|"z")`
+fn import_name_and_alias(node: Node, src: &[u8]) -> (String, String) {
+    if node.kind() == "aliased_import" {
+        let name = node
+            .child_by_field_name("name")
+            .map(|n| node_text(n, src).to_string())
+            .unwrap_or_default();
+        let alias = node
+            .child_by_field_name("alias")
+            .map(|n| node_text(n, src).to_string())
+            .unwrap_or_default();
+        (name, alias)
+    } else {
+        (node_text(node, src).to_string(), String::new())
+    }
+}
+
+/// Walk top-level statements, defining module-level symbols and global bindings.
+#[allow(clippy::too_many_arguments)]
 fn collect_globals(
     root: Node,
     path: &Path,
@@ -77,15 +169,13 @@ fn collect_globals(
     _module_id: SymbolId,
     next_id: &mut usize,
     symbols: &mut Vec<Symbol>,
-    scope: &mut FileScope,
+    scopes: &mut Scopes,
 ) {
     let mut cursor = root.walk();
-    for child in root.children(&mut cursor) {
-        let kind = child.kind();
-        let _name = node_text(child, src.as_bytes()).to_string();
-        match kind {
+    for child in root.named_children(&mut cursor) {
+        match child.kind() {
             "function_definition" | "decorated_definition" => {
-                let fn_node = if kind == "decorated_definition" {
+                let fn_node = if child.kind() == "decorated_definition" {
                     child.child_by_field_name("definition")
                 } else {
                     Some(child)
@@ -95,15 +185,14 @@ fn collect_globals(
                         let sym_name = node_text(name_node, src.as_bytes()).to_string();
                         let id = *next_id;
                         *next_id += 1;
-                        scope.names.insert(sym_name.clone(), id);
-                        symbols.push(Symbol {
+                        scopes.declare(&sym_name, Binding::Global(id));
+                        symbols.push(symbol(
                             id,
-                            name: sym_name,
-                            kind: SymbolKind::Function,
-                            file: path.to_path_buf(),
-                            span: span(fn_node),
-                            reachable: false,
-                        });
+                            &sym_name,
+                            SymbolKind::Function,
+                            path,
+                            fn_node,
+                        ));
                     }
                 }
             }
@@ -112,164 +201,219 @@ fn collect_globals(
                     let sym_name = node_text(name_node, src.as_bytes()).to_string();
                     let id = *next_id;
                     *next_id += 1;
-                    scope.names.insert(sym_name.clone(), id);
-                    symbols.push(Symbol {
-                        id,
-                        name: sym_name,
-                        kind: SymbolKind::Class,
-                        file: path.to_path_buf(),
-                        span: span(child),
-                        reachable: false,
-                    });
+                    scopes.declare(&sym_name, Binding::Global(id));
+                    symbols.push(symbol(id, &sym_name, SymbolKind::Class, path, child));
                 }
             }
             "import_statement" => {
                 let mut c2 = child.walk();
                 for clause in child.named_children(&mut c2) {
-                    match clause.kind() {
-                        "dotted_name" => {
-                            let sym_name = node_text(clause, src.as_bytes()).to_string();
-                            let id = *next_id;
-                            *next_id += 1;
-                            scope.names.insert(sym_name.clone(), id);
-                            symbols.push(Symbol {
-                                id,
-                                name: sym_name,
-                                kind: SymbolKind::Import,
-                                file: path.to_path_buf(),
-                                span: span(clause),
-                                reachable: false,
-                            });
-                        }
-                        "aliased_import" => {
-                            let sym_name = clause
-                                .child_by_field_name("name")
-                                .map(|n| node_text(n, src.as_bytes()).to_string())
-                                .unwrap_or_default();
-                            if sym_name.is_empty() {
-                                continue;
-                            }
-                            let id = *next_id;
-                            *next_id += 1;
-                            scope.names.insert(sym_name.clone(), id);
-                            symbols.push(Symbol {
-                                id,
-                                name: sym_name,
-                                kind: SymbolKind::Import,
-                                file: path.to_path_buf(),
-                                span: span(clause),
-                                reachable: false,
-                            });
-                        }
-                        _ => {}
+                    let (sym_name, alias) = import_name_and_alias(clause, src.as_bytes());
+                    if sym_name.is_empty() {
+                        continue;
                     }
+                    let id = *next_id;
+                    *next_id += 1;
+                    let bound = if alias.is_empty() { &sym_name } else { &alias };
+                    scopes.declare(bound, Binding::Global(id));
+                    symbols.push(symbol(id, &sym_name, SymbolKind::Import, path, clause));
                 }
             }
             "import_from_statement" => {
-                // `from X import a, b`: module is a field, each imported name is a
-                // child with field "name".
+                let module = child.child_by_field_name("module_name");
                 let mut c2 = child.walk();
                 for clause in child.named_children(&mut c2) {
-                    // The module itself.
-                    if clause.kind() == "dotted_name" && child.field_name_for_child(0) == Some("module_name") {
-                        let sym_name = node_text(clause, src.as_bytes()).to_string();
-                        let id = *next_id;
-                        *next_id += 1;
-                        scope.names.insert(sym_name.clone(), id);
-                        symbols.push(Symbol {
-                            id,
-                            name: sym_name,
-                            kind: SymbolKind::Import,
-                            file: path.to_path_buf(),
-                            span: span(clause),
-                            reachable: false,
-                        });
-                    } else {
-                        // Imported names: identifier or aliased_import.
-                        let sym_name = match clause.kind() {
-                            "aliased_import" => clause
-                                .child_by_field_name("name")
-                                .map(|n| node_text(n, src.as_bytes()).to_string())
-                                .unwrap_or_default(),
-                            _ => node_text(clause, src.as_bytes()).to_string(),
-                        };
-                        if sym_name.is_empty() {
+                    // Star import: bind the module name as uncertain.
+                    if clause.kind() == "wildcard_import" {
+                        if let Some(m) = module {
+                            let mn = node_text(m, src.as_bytes()).to_string();
+                            scopes.declare(&mn, Binding::Dynamic);
+                        }
+                        continue;
+                    }
+                    // Skip the module dotted_name itself; only bind imported names.
+                    if let Some(m) = module {
+                        if clause == m {
                             continue;
                         }
-                        let id = *next_id;
-                        *next_id += 1;
-                        scope.names.insert(sym_name.clone(), id);
-                        symbols.push(Symbol {
-                            id,
-                            name: sym_name,
-                            kind: SymbolKind::Import,
-                            file: path.to_path_buf(),
-                            span: span(clause),
-                            reachable: false,
-                        });
                     }
+                    let (sym_name, alias) = import_name_and_alias(clause, src.as_bytes());
+                    if sym_name.is_empty() {
+                        continue;
+                    }
+                    let id = *next_id;
+                    *next_id += 1;
+                    let bound = if alias.is_empty() { &sym_name } else { &alias };
+                    scopes.declare(bound, Binding::Global(id));
+                    symbols.push(symbol(id, &sym_name, SymbolKind::Import, path, clause));
                 }
             }
-            "module" | "expression_statement" | "comment" => {}
             _ => {}
         }
     }
 }
 
-/// Walk all identifiers, emitting references from the enclosing symbol to any
-/// global-scope name they resolve to.
-///
-/// Function and class *bodies* are traversed so that calls count as usage; the
-/// definition name and parameters are skipped. References are attributed to the
-/// nearest enclosing function/class symbol when one exists.
-fn collect_references(
-    root: Node,
-    src: &str,
-    module_id: SymbolId,
-    scope: &FileScope,
-    refs: &mut Vec<(SymbolId, String, RefKind)>,
-) {
-    let mut cursor = root.walk();
-    for node in root.children(&mut cursor) {
-        walk_identifiers(node, src, &scope, module_id, refs);
+/// Bind every simple identifier in a parameters node / assignment target as a local.
+fn bind_local_identifiers(node: Node, src: &[u8], scopes: &mut Scopes) {
+    match node.kind() {
+        "identifier" => {
+            scopes.declare(node_text(node, src), Binding::Local);
+        }
+        "pattern_list" | "tuple_pattern" | "list_pattern" | "list_splat_pattern"
+        | "dictionary_splat_pattern" | "typed_parameter" | "default_parameter"
+        | "typed_default_parameter" | "keyword_argument" => {
+            let mut cursor = node.walk();
+            for child in node.named_children(&mut cursor) {
+                bind_local_identifiers(child, src, scopes);
+            }
+        }
+        _ => {}
     }
 }
 
-fn walk_identifiers(
+/// Walk the tree, tracking scopes and emitting references.
+fn collect_refs(
+    root: Node,
+    src: &str,
+    module_id: SymbolId,
+    scopes: &mut Scopes,
+    refs: &mut Vec<UnresolvedRef>,
+) {
+    let mut cursor = root.walk();
+    for child in root.named_children(&mut cursor) {
+        walk_node(child, src, module_id, scopes, refs);
+    }
+}
+
+fn walk_node(
     node: Node,
     src: &str,
-    scope: &FileScope,
     enclosing: SymbolId,
-    refs: &mut Vec<(SymbolId, String, RefKind)>,
+    scopes: &mut Scopes,
+    refs: &mut Vec<UnresolvedRef>,
 ) {
-    // Import subtrees don't contain uses; skip them wholesale.
-    if matches!(node.kind(), "import_statement" | "import_from_statement") {
-        return;
-    }
+    match node.kind() {
+        // Import statements contain no uses; skip.
+        "import_statement" | "import_from_statement" => {}
+        // Enter function/class bodies: push a scope, bind the def name + params,
+        // and attribute internal references to the definition.
+        "function_definition" | "class_definition" => {
+            let def_id = node
+                .child_by_field_name("name")
+                .and_then(|n| scopes.resolve(node_text(n, src.as_bytes())))
+                .and_then(|b| match b {
+                    Binding::Global(id) => Some(id),
+                    _ => None,
+                })
+                .unwrap_or(enclosing);
 
-    // Inside a function/class definition, switch the enclosing symbol to that
-    // definition and recurse into its body (skipping the name/params).
-    if matches!(node.kind(), "function_definition" | "class_definition") {
-        if let Some(name_node) = node.child_by_field_name("name") {
-            let def_name = node_text(name_node, src.as_bytes());
-            if let Some(&def_id) = scope.names.get(def_name) {
-                let body = node.child_by_field_name("body");
-                if let Some(body) = body {
-                    walk_identifiers(body, src, scope, def_id, refs);
+            scopes.push();
+            if let Some(name_node) = node.child_by_field_name("name") {
+                scopes.declare(node_text(name_node, src.as_bytes()), Binding::Local);
+            }
+            if node.kind() == "class_definition" {
+                scopes.declare("self", Binding::Local);
+            }
+            if let Some(params) = node.child_by_field_name("parameters") {
+                bind_local_identifiers(params, src.as_bytes(), scopes);
+            }
+            if let Some(body) = node.child_by_field_name("body") {
+                let mut cursor = body.walk();
+                for child in body.named_children(&mut cursor) {
+                    walk_node(child, src, def_id, scopes, refs);
                 }
-                return;
+            }
+            scopes.pop();
+        }
+        // Assignments introduce locals on the left; the right side may still reference.
+        "assignment" => {
+            if let Some(left) = node.child_by_field_name("left") {
+                bind_local_identifiers(left, src.as_bytes(), scopes);
+            }
+            let mut cursor = node.walk();
+            for child in node.named_children(&mut cursor) {
+                walk_node(child, src, enclosing, scopes, refs);
+            }
+        }
+        // Uncertain runtime constructs.
+        "call" => {
+            handle_call(node, src, enclosing, scopes, refs);
+        }
+        "identifier" => {
+            let name = node_text(node, src.as_bytes()).to_string();
+            match scopes.resolve(&name) {
+                Some(Binding::Global(id)) => refs.push(UnresolvedRef {
+                    from: enclosing,
+                    target: RefTarget::Symbol(id),
+                    kind: RefKind::Static,
+                }),
+                Some(Binding::Dynamic) => refs.push(UnresolvedRef {
+                    from: enclosing,
+                    target: RefTarget::Name(name),
+                    kind: RefKind::Dynamic,
+                }),
+                _ => {}
+            }
+        }
+        _ => {
+            let mut cursor = node.walk();
+            for child in node.named_children(&mut cursor) {
+                walk_node(child, src, enclosing, scopes, refs);
+            }
+        }
+    }
+}
+
+/// Detect uncertain runtime patterns in a call expression.
+fn handle_call(
+    node: Node,
+    src: &str,
+    enclosing: SymbolId,
+    scopes: &mut Scopes,
+    refs: &mut Vec<UnresolvedRef>,
+) {
+    // `getattr(obj, "name")` and `__import__("mod")` are reflection/dynamic.
+    if let Some(func) = node.child_by_field_name("function") {
+        let fname = node_text(func, src.as_bytes());
+        if fname == "getattr" {
+            if let Some(arg) = node.child_by_field_name("arguments") {
+                let mut c = arg.walk();
+                let args: Vec<Node> = arg.named_children(&mut c).collect();
+                if let Some(second) = args.get(1) {
+                    let v = node_text(*second, src.as_bytes());
+                    let stripped = v.trim_matches(['\'', '"']);
+                    if !stripped.is_empty() {
+                        refs.push(UnresolvedRef {
+                            from: enclosing,
+                            target: RefTarget::Name(stripped.to_string()),
+                            kind: RefKind::Reflection,
+                        });
+                    }
+                }
+            }
+        } else if fname == "__import__" {
+            if let Some(arg) = node.child_by_field_name("arguments") {
+                let mut c = arg.walk();
+                for a in arg.named_children(&mut c) {
+                    if a.kind() == "string" {
+                        let v = node_text(a, src.as_bytes());
+                        let stripped = v.trim_matches(['\'', '"']);
+                        if !stripped.is_empty() {
+                            refs.push(UnresolvedRef {
+                                from: enclosing,
+                                target: RefTarget::Name(stripped.to_string()),
+                                kind: RefKind::Dynamic,
+                            });
+                        }
+                    }
+                }
             }
         }
     }
 
+    // Recurse into the call normally for other references.
     let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        if child.kind() == "identifier" {
-            let name = node_text(child, src.as_bytes()).to_string();
-            if scope.names.contains_key(&name) {
-                refs.push((enclosing, name, RefKind::Static));
-            }
-        }
-        walk_identifiers(child, src, scope, enclosing, refs);
+    for child in node.named_children(&mut cursor) {
+        walk_node(child, src, enclosing, scopes, refs);
     }
 }
