@@ -46,7 +46,15 @@ pub fn compute_reachability(program: &mut Program) {
     }
     program.reachable.clear();
 
+    // Seed from explicit entrypoints plus public API roots (exports). Exported names
+    // are treated as used by external consumers, so they and their definitions stay
+    // reachable and are never classified as bloat.
     let mut queue: VecDeque<SymbolId> = program.entrypoints.iter().copied().collect();
+    for sym in &program.symbols {
+        if sym.kind == SymbolKind::Export {
+            queue.push_back(sym.id);
+        }
+    }
     let mut seen = std::collections::HashSet::new();
 
     while let Some(id) = queue.pop_front() {
@@ -74,8 +82,11 @@ pub fn analyze(program: &mut Program, model: &CostModel) -> Report {
     let mut findings = Vec::new();
 
     for sym in &program.symbols {
-        // Modules and entrypoints are structural; skip.
-        if sym.kind == SymbolKind::Module || program.entrypoints.contains(&sym.id) {
+        // Modules and exports are structural/public declarations; skip. Entrypoints
+        // are user-designated roots and are never bloat.
+        if matches!(sym.kind, SymbolKind::Module | SymbolKind::Export)
+            || program.entrypoints.contains(&sym.id)
+        {
             continue;
         }
 

@@ -9,7 +9,9 @@ use std::path::Path;
 
 use parse::parse_file;
 use spectograph_analyzer::{Analyzer, AnalyzeError, discover};
-use spectograph_core::ir::{Language, Program, Reference, SymbolId};
+use spectograph_core::ir::{
+    Language, Program, Reference, RefKind, Symbol, SymbolId, SymbolKind,
+};
 
 /// Analyzer for the Python language.
 pub struct PythonAnalyzer;
@@ -91,11 +93,11 @@ impl Analyzer for PythonAnalyzer {
         }
 
         // Pass 3: link each import to the definition it re-exports, so reachability
-        // flows through imports to the actual code. Skip the import itself.
+        // flows through imports to the actual code.
         let import_ids: Vec<SymbolId> = program
             .symbols
             .iter()
-            .filter(|s| s.kind == spectograph_core::ir::SymbolKind::Import)
+            .filter(|s| s.kind == SymbolKind::Import)
             .map(|s| s.id)
             .collect();
         for import_id in import_ids {
@@ -106,21 +108,78 @@ impl Analyzer for PythonAnalyzer {
                     program.references.push(Reference {
                         from: import_id,
                         to: def_id,
-                        kind: spectograph_core::ir::RefKind::ReExport,
+                        kind: RefKind::ReExport,
                     });
                 }
             }
         }
 
-        // Entrypoints: modules that define `__main__` (their module symbol).
-        for (i, sym) in program.symbols.iter().enumerate() {
-            if sym.kind == spectograph_core::ir::SymbolKind::Module {
+        // Pass 4: create Export symbols for each `__all__` declaration, link them to
+        // their definitions, and add module -> import/export edges so reaching a module
+        // reaches its re-exports and public API.
+        for (_path, result) in &parsed {
+            let module_id = result.module_id;
+            let module_file = program
+                .symbol(module_id)
+                .map(|s| s.file.clone())
+                .unwrap_or_default();
+            let is_pkg_root = module_file.file_name().map(|n| n == "__init__.py").unwrap_or(false);
+
+            // In `__init__.py`, top-level imports ARE re-exports (public API), so
+            // reaching the package root reaches them. In ordinary modules an import is
+            // only "used" when referenced, so we don't add this edge there.
+            if is_pkg_root {
+                for sym in &result.symbols {
+                    if sym.kind == SymbolKind::Import {
+                        program.references.push(Reference {
+                            from: module_id,
+                            to: sym.id,
+                            kind: RefKind::ReExport,
+                        });
+                    }
+                }
+            }
+
+            // `__all__` exports.
+            for decl in &result.exports {
+                let id = next_id;
+                next_id += 1;
+                program.symbols.push(Symbol {
+                    id,
+                    name: decl.name.clone(),
+                    kind: SymbolKind::Export,
+                    file: module_file.clone(),
+                    span: decl.span,
+                    reachable: false,
+                });
+                // module -> export
+                program.references.push(Reference {
+                    from: module_id,
+                    to: id,
+                    kind: RefKind::ReExport,
+                });
+                // export -> definition
+                if let Some(&def_id) = def_index.get(&decl.name) {
+                    program.references.push(Reference {
+                        from: id,
+                        to: def_id,
+                        kind: RefKind::ReExport,
+                    });
+                }
+            }
+        }
+
+        // Entrypoints: modules with a `__main__` guard, plus `__init__.py` package roots.
+        for sym in &program.symbols {
+            if sym.kind == SymbolKind::Module {
                 let file = sym.file.to_string_lossy().into_owned();
-                if file_entry.get(&file).copied().unwrap_or(false) {
+                let is_init = sym
+                    .file
+                    .file_name()
+                    .map(|n| n == "__init__.py")
+                    .unwrap_or(false);
+                if file_entry.get(&file).copied().unwrap_or(false) || is_init {
                     program.entrypoints.push(sym.id);
-                    // Also make reachable anything the entry module uses, but
-                    // reachability computation in core handles traversal.
-                    let _ = i;
                 }
             }
         }

@@ -67,6 +67,15 @@ pub struct FileResult {
     /// References whose `from` is a symbol in this file and `to` may be any file
     /// (resolved later once all modules are known).
     pub refs: Vec<UnresolvedRef>,
+    /// Names declared public via `__all__`.
+    pub exports: Vec<ExportDecl>,
+}
+
+/// A single name declared in a module's `__all__`.
+#[derive(Debug, Clone)]
+pub struct ExportDecl {
+    pub name: String,
+    pub span: SourceSpan,
 }
 
 /// The target of a reference discovered during single-file parsing.
@@ -124,6 +133,7 @@ pub fn parse_file(
     let mut scopes = Scopes::new();
     let mut symbols = Vec::new();
     let mut refs = Vec::new();
+    let mut exports = Vec::new();
 
     let module = symbol(
         module_id,
@@ -134,10 +144,10 @@ pub fn parse_file(
     );
     symbols.push(module);
 
-    collect_globals(root, path, src, module_id, next_id, &mut symbols, &mut scopes);
+    collect_globals(root, path, src, module_id, next_id, &mut symbols, &mut scopes, &mut exports);
     collect_refs(root, src, module_id, &mut scopes, &mut refs);
 
-    FileResult { module_id, symbols, refs }
+    FileResult { module_id, symbols, refs, exports }
 }
 
 /// Extract the imported name and its alias from an import clause node.
@@ -170,6 +180,7 @@ fn collect_globals(
     next_id: &mut usize,
     symbols: &mut Vec<Symbol>,
     scopes: &mut Scopes,
+    exports: &mut Vec<ExportDecl>,
 ) {
     let mut cursor = root.walk();
     for child in root.named_children(&mut cursor) {
@@ -246,6 +257,31 @@ fn collect_globals(
                     let bound = if alias.is_empty() { &sym_name } else { &alias };
                     scopes.declare(bound, Binding::Global(id));
                     symbols.push(symbol(id, &sym_name, SymbolKind::Import, path, clause));
+                }
+            }
+            // `__all__ = ["a", "b"]` declares the module's public API.
+            "expression_statement" => {
+                if let Some(assign) = child.named_child(0) {
+                    if assign.kind() == "assignment" {
+                        let is_all = assign
+                            .child_by_field_name("left")
+                            .map(|l| node_text(l, src.as_bytes()) == "__all__")
+                            .unwrap_or(false);
+                        if is_all {
+                            if let Some(right) = assign.child_by_field_name("right") {
+                                let mut c3 = right.walk();
+                                for s in right.named_children(&mut c3) {
+                                    if s.kind() == "string" {
+                                        let v = node_text(s, src.as_bytes());
+                                        let name = v.trim_matches(['\'', '"']).to_string();
+                                        if !name.is_empty() {
+                                            exports.push(ExportDecl { name, span: span(s) });
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
             }
             _ => {}

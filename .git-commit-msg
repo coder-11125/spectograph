@@ -1,0 +1,14 @@
+Implement __init__.py re-exports and __all__ package-level dead code
+
+- Parse `__all__ = [...]` into Export symbols linked (ReExport) to their
+  definitions; exports are seeded as public-API reachability roots, so
+  declared-public names are never classified as bloat.
+- Treat `__init__.py` as a package root entrypoint; its top-level imports
+  are re-exports that flow reachability to submodule definitions.
+- Only __init__.py gets the module->import reachability edge; ordinary
+  modules still flag unused imports (preserves unused-import detection).
+- Exports are skipped in bloat classification (structural/public).
+- Core analysis seeds reachability from exports as public API roots.
+- 4 package integration tests: re-export reachability, __all__ protects
+  public members, export->definition linking, package-level dead code.
+- New example fixture examples/python-pkg.
