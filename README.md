@@ -48,6 +48,31 @@ cargo run -p spectograph-cli -- check . --language python
 
 Exit code is nonzero when bloat at or above `--fail-on` tier is found.
 
+## Fixtures
+
+Real Python sample projects live under `fixtures/` (not `examples/`) and are exercised by
+automated tests in `spectograph-py/tests/fixtures.rs`, which assert which symbols are
+reachable and which are dead:
+
+- `fixtures/python-sample` — entrypoint + dead code / unused imports
+- `fixtures/python-pkg` — `__init__.py` re-exports and `__all__`
+- `fixtures/python-scripts` — `pyproject.toml` console-script entrypoints
+
+```sh
+cargo test -p spectograph-py --test fixtures
+```
+
+Keeping these as versioned, test-backed fixtures (rather than a gitignored `examples/`)
+ensures the Python sample code does not inflate the repo's language breakdown while still
+being load-bearing.
+
+## Tests
+
+```sh
+cargo test              # full workspace
+cargo clippy --all-targets
+```
+
 ## Workspace
 
 | Crate | Purpose |
