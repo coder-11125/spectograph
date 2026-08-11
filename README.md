@@ -20,8 +20,9 @@ Implemented:
   `pyproject.toml` `[project.scripts]` / `[project.gui-scripts]` console scripts).
 - Python resolution: scope/shadowing, import aliasing, dynamic constructs marked
   uncertain (star imports, `getattr`, `__import__`), class method/attribute resolution
-  (`self.method()`, `obj.method()`, constructor `__init__`), and relative-import
-  resolution (`from .sub import x`, `from .. import y`) that links to the correct module.
+  (`self.method()`, `obj.method()`, constructor `__init__`), relative-import resolution
+  (`from .sub import x`, `from .. import y`), and inheritance (`super().method()` reaches
+  parent methods; subclassing keeps base classes reachable).
 - Package handling: `__init__.py` re-exports as package roots, and `__all__` names as
   public API (never flagged as bloat).
 - `.gitignore`-aware file discovery.

@@ -44,6 +44,31 @@ fn python_classes_fixture() {
     assert!(is_flagged(&report, "unused_method"), "unused_method is never called");
 }
 
+/// python-inheritance: Child subclasses Base; super().greet() reaches Base.greet;
+/// Base is reachable via subclassing; dead methods in both are flagged.
+#[test]
+fn python_inheritance_fixture() {
+    let mut program = analyze("python-inheritance");
+    let report = report(&mut program);
+
+    // Reachable via inheritance and super().
+    assert!(!is_flagged(&report, "Base"), "Base is used via subclassing");
+    assert!(!is_flagged(&report, "greet"), "both greet methods are used");
+
+    // Dead methods.
+    assert!(is_flagged(&report, "base_only"), "base_only is never called");
+    assert!(is_flagged(&report, "unused_child_method"), "unused_child_method is never called");
+
+    // super() must reach the base class's greet method: both greet methods (base and
+    // child) are reachable.
+    let reachable_greets = program
+        .symbols
+        .iter()
+        .filter(|s| s.name == "greet" && s.reachable)
+        .count();
+    assert!(reachable_greets >= 2, "both base and child greet should be reachable");
+}
+
 /// python-relative: relative imports resolve to the correct module. core.helper is
 /// reachable via `from .core import helper`; other.helper (same name, different module)
 /// stays dead.

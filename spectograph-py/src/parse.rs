@@ -150,6 +150,8 @@ pub fn parse_file(
     let mut imports = Vec::new();
     // class id -> (method name -> method symbol id), for `self.method()` resolution.
     let mut class_methods: HashMap<SymbolId, HashMap<String, SymbolId>> = HashMap::new();
+    // class id -> parent class names (resolved to ids after the globals pass).
+    let mut class_bases: HashMap<SymbolId, Vec<String>> = HashMap::new();
 
     let module = symbol(
         module_id,
@@ -160,8 +162,26 @@ pub fn parse_file(
     );
     symbols.push(module);
 
-    collect_globals(root, path, src, module_id, next_id, &mut symbols, &mut scopes, &mut exports, &mut class_methods, &mut imports);
-    collect_refs(root, src, module_id, &mut scopes, &mut refs, &class_methods);
+    collect_globals(root, path, src, module_id, next_id, &mut symbols, &mut scopes, &mut exports, &mut class_methods, &mut imports, &mut class_bases);
+
+    // Resolve base-class names to ids once all class symbols are known.
+    let mut resolved_bases: HashMap<SymbolId, Vec<SymbolId>> = HashMap::new();
+    let class_names: HashMap<String, SymbolId> = symbols
+        .iter()
+        .filter(|s| s.kind == SymbolKind::Class)
+        .map(|s| (s.name.clone(), s.id))
+        .collect();
+    for (cid, base_names) in &class_bases {
+        let ids: Vec<SymbolId> = base_names
+            .iter()
+            .filter_map(|n| class_names.get(n).copied())
+            .collect();
+        if !ids.is_empty() {
+            resolved_bases.insert(*cid, ids);
+        }
+    }
+
+    collect_refs(root, src, module_id, &mut scopes, &mut refs, &class_methods, &resolved_bases);
 
     FileResult { module_id, symbols, refs, exports, imports }
 }
@@ -224,6 +244,7 @@ fn collect_globals(
     exports: &mut Vec<ExportDecl>,
     class_methods: &mut HashMap<SymbolId, HashMap<String, SymbolId>>,
     imports: &mut Vec<ImportDecl>,
+    class_bases: &mut HashMap<SymbolId, Vec<String>>,
 ) {
     let mut cursor = root.walk();
     for child in root.named_children(&mut cursor) {
@@ -257,6 +278,29 @@ fn collect_globals(
                     *next_id += 1;
                     scopes.declare(&sym_name, Binding::Global(id));
                     symbols.push(symbol(id, &sym_name, SymbolKind::Class, path, child));
+
+                    // Record base class names (`class B(A, C):`) for super() resolution.
+                    let mut base_names: Vec<String> = Vec::new();
+                    if let Some(args) = child.child_by_field_name("superclasses") {
+                        let mut ca = args.walk();
+                        for b in args.named_children(&mut ca) {
+                            let bname = node_text(b, src.as_bytes()).to_string();
+                            if !bname.is_empty() {
+                                base_names.push(bname);
+                            }
+                        }
+                    } else if let Some(args) = child.child_by_field_name("arguments") {
+                        let mut ca = args.walk();
+                        for b in args.named_children(&mut ca) {
+                            let bname = node_text(b, src.as_bytes()).to_string();
+                            if !bname.is_empty() {
+                                base_names.push(bname);
+                            }
+                        }
+                    }
+                    if !base_names.is_empty() {
+                        class_bases.insert(id, base_names);
+                    }
 
                     // Extract methods (function definitions in the class body) so that
                     // `self.method()` can be resolved to a symbol.
@@ -407,10 +451,11 @@ fn collect_refs(
     scopes: &mut Scopes,
     refs: &mut Vec<UnresolvedRef>,
     class_methods: &HashMap<SymbolId, HashMap<String, SymbolId>>,
+    class_bases: &HashMap<SymbolId, Vec<SymbolId>>,
 ) {
     let mut cursor = root.walk();
     for child in root.named_children(&mut cursor) {
-        walk_node(child, src, module_id, scopes, refs, None, class_methods);
+        walk_node(child, src, module_id, scopes, refs, None, class_methods, class_bases);
     }
 }
 
@@ -423,6 +468,7 @@ fn walk_node(
     refs: &mut Vec<UnresolvedRef>,
     current_class: Option<SymbolId>,
     class_methods: &HashMap<SymbolId, HashMap<String, SymbolId>>,
+    class_bases: &HashMap<SymbolId, Vec<SymbolId>>,
 ) {
     match node.kind() {
         // Import statements contain no uses; skip.
@@ -431,6 +477,16 @@ fn walk_node(
         // internal references to the class, passing the class context downward.
         "class_definition" => {
             let def_id = resolve_def_id(node, src, scopes, enclosing);
+            // A class references its base classes: subclassing counts as usage.
+            if let Some(bases) = class_bases.get(&def_id) {
+                for &parent in bases {
+                    refs.push(UnresolvedRef {
+                        from: def_id,
+                        target: RefTarget::Symbol(parent),
+                        kind: RefKind::Static,
+                    });
+                }
+            }
             // A used class is instantiated, so its constructor is used.
             if let Some(methods) = class_methods.get(&def_id) {
                 if let Some(&init_id) = methods.get("__init__") {
@@ -449,7 +505,7 @@ fn walk_node(
             if let Some(body) = node.child_by_field_name("body") {
                 let mut cursor = body.walk();
                 for child in body.named_children(&mut cursor) {
-                    walk_node(child, src, def_id, scopes, refs, Some(def_id), class_methods);
+                    walk_node(child, src, def_id, scopes, refs, Some(def_id), class_methods, class_bases);
                 }
             }
             scopes.pop();
@@ -468,7 +524,7 @@ fn walk_node(
             if let Some(body) = node.child_by_field_name("body") {
                 let mut cursor = body.walk();
                 for child in body.named_children(&mut cursor) {
-                    walk_node(child, src, def_id, scopes, refs, current_class, class_methods);
+                    walk_node(child, src, def_id, scopes, refs, current_class, class_methods, class_bases);
                 }
             }
             scopes.pop();
@@ -480,20 +536,21 @@ fn walk_node(
             }
             let mut cursor = node.walk();
             for child in node.named_children(&mut cursor) {
-                walk_node(child, src, enclosing, scopes, refs, current_class, class_methods);
+                walk_node(child, src, enclosing, scopes, refs, current_class, class_methods, class_bases);
             }
         }
-        // Attribute access: `self.method` resolves to the enclosing class's method.
+        // Attribute access: `self.method` resolves to the enclosing class's method,
+        // and `super().method` resolves to a parent class's method.
         "attribute" => {
-            resolve_self_attribute(node, src, enclosing, current_class, class_methods, refs);
+            resolve_self_attribute(node, src, enclosing, current_class, class_methods, class_bases, refs);
             let mut cursor = node.walk();
             for child in node.named_children(&mut cursor) {
-                walk_node(child, src, enclosing, scopes, refs, current_class, class_methods);
+                walk_node(child, src, enclosing, scopes, refs, current_class, class_methods, class_bases);
             }
         }
         // Uncertain runtime constructs.
         "call" => {
-            handle_call(node, src, enclosing, scopes, refs, current_class, class_methods);
+            handle_call(node, src, enclosing, scopes, refs, current_class, class_methods, class_bases);
         }
         "identifier" => {
             let name = node_text(node, src.as_bytes()).to_string();
@@ -514,7 +571,7 @@ fn walk_node(
         _ => {
             let mut cursor = node.walk();
             for child in node.named_children(&mut cursor) {
-                walk_node(child, src, enclosing, scopes, refs, current_class, class_methods);
+                walk_node(child, src, enclosing, scopes, refs, current_class, class_methods, class_bases);
             }
         }
     }
@@ -533,25 +590,50 @@ fn resolve_def_id(node: Node, src: &str, scopes: &Scopes, enclosing: SymbolId) -
 }
 
 /// Resolve `self.<method>` (and `cls.<method>`) attribute access to the enclosing
-/// class's method symbol.
+/// class's method symbol, and `super().<method>` / `super(B, self).<method>` to a
+/// parent class's method.
 fn resolve_self_attribute(
     node: Node,
     src: &str,
     enclosing: SymbolId,
     current_class: Option<SymbolId>,
     class_methods: &HashMap<SymbolId, HashMap<String, SymbolId>>,
+    class_bases: &HashMap<SymbolId, Vec<SymbolId>>,
     refs: &mut Vec<UnresolvedRef>,
 ) {
     let Some(current_class) = current_class else { return };
     let obj = node.child_by_field_name("object");
+    let attr = node.child_by_field_name("attribute");
+    let attr_name = attr.map(|a| node_text(a, src.as_bytes())).unwrap_or("");
+
+    // `super().method` / `super(B, self).method`: resolve against a parent class.
+    if let Some(obj) = obj {
+        let obj_text = node_text(obj, src.as_bytes());
+        if obj_text.starts_with("super") {
+            if let Some(bases) = class_bases.get(&current_class) {
+                for &parent in bases {
+                    if let Some(pmethods) = class_methods.get(&parent) {
+                        if let Some(&mid) = pmethods.get(attr_name) {
+                            refs.push(UnresolvedRef {
+                                from: enclosing,
+                                target: RefTarget::Symbol(mid),
+                                kind: RefKind::Static,
+                            });
+                            return;
+                        }
+                    }
+                }
+            }
+            return;
+        }
+    }
+
     let obj_is_self = obj
         .map(|o| node_text(o, src.as_bytes()) == "self")
         .unwrap_or(false);
     if !obj_is_self {
         return;
     }
-    let attr = node.child_by_field_name("attribute");
-    let attr_name = attr.map(|a| node_text(a, src.as_bytes())).unwrap_or("");
     if let Some(methods) = class_methods.get(&current_class) {
         if let Some(&mid) = methods.get(attr_name) {
             refs.push(UnresolvedRef {
@@ -564,6 +646,7 @@ fn resolve_self_attribute(
 }
 
 /// Detect uncertain runtime patterns in a call expression.
+#[allow(clippy::too_many_arguments)]
 fn handle_call(
     node: Node,
     src: &str,
@@ -572,6 +655,7 @@ fn handle_call(
     refs: &mut Vec<UnresolvedRef>,
     current_class: Option<SymbolId>,
     class_methods: &HashMap<SymbolId, HashMap<String, SymbolId>>,
+    class_bases: &HashMap<SymbolId, Vec<SymbolId>>,
 ) {
     // `getattr(obj, "name")` and `__import__("mod")` are reflection/dynamic.
     if let Some(func) = node.child_by_field_name("function") {
@@ -615,6 +699,6 @@ fn handle_call(
     // Recurse into the call normally for other references.
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
-        walk_node(child, src, enclosing, scopes, refs, current_class, class_methods);
+        walk_node(child, src, enclosing, scopes, refs, current_class, class_methods, class_bases);
     }
 }
