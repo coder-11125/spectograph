@@ -25,6 +25,9 @@ Implemented:
   parent methods; subclassing keeps base classes reachable).
 - Package handling: `__init__.py` re-exports as package roots, and `__all__` names as
   public API (never flagged as bloat).
+- Optional **type-aware resolution** via basedpyright: `--resolution pyright` shells out
+  to the basedpyright LSP server for find-references, resolving `obj.method()` by real
+  type instead of name. Falls back to the static resolver when unavailable.
 - `.gitignore`-aware file discovery.
 - `check` with `--format human|json` and `--fail-on <tier>` (exit codes for CI).
 
@@ -45,8 +48,11 @@ cargo run -p spectograph-cli -- check . --format json
 # Fail the build only on guaranteed bloat
 cargo run -p spectograph-cli -- check . --fail-on guaranteed
 
-# Pick the language explicitly (else auto-detected)
-cargo run -p spectograph-cli -- check . --language python
+# Type-aware resolution via basedpyright (needs basedpyright on PATH)
+cargo run -p spectograph-cli -- check . --resolution pyright
+
+# Point at a specific basedpyright LSP server executable
+cargo run -p spectograph-cli -- check . --resolution pyright --pyright-executable /path/to/basedpyright-langserver
 ```
 
 Exit code is nonzero when bloat at or above `--fail-on` tier is found.

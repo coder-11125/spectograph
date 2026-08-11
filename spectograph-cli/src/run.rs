@@ -56,7 +56,15 @@ fn tier_from_str(s: &str) -> Result<BloatTier, String> {
     }
 }
 
-fn run_check(root: &Path, format: &str, language: Option<&str>, fail_on: &str) -> Result<i32, String> {
+fn run_check(
+    root: &Path,
+    format: &str,
+    language: Option<&str>,
+    fail_on: &str,
+    resolution: &str,
+    pyright_executable: Option<&str>,
+    pyright_timeout: u64,
+) -> Result<i32, String> {
     let lang = match language {
         Some(l) => l.to_string(),
         None => detect_language(root)
@@ -66,9 +74,24 @@ fn run_check(root: &Path, format: &str, language: Option<&str>, fail_on: &str) -
     };
 
     let analyzer = analyzer_for(&lang)?;
-    let mut program = analyzer
-        .analyze(root)
-        .map_err(|e| format!("analysis failed: {e}"))?;
+    let mut program = if lang.starts_with("python") && resolution == "pyright" {
+        // Type-aware resolution via basedpyright.
+        let py = PythonAnalyzer;
+        py.analyze_with_resolution(
+            root,
+            spectograph_py::ResolutionMode::Pyright,
+            pyright_executable,
+            pyright_timeout,
+        )
+        .map_err(|e| format!("analysis failed: {e}"))?
+    } else {
+        if resolution == "pyright" {
+            return Err("--resolution pyright is only supported for python currently".to_string());
+        }
+        analyzer
+            .analyze(root)
+            .map_err(|e| format!("analysis failed: {e}"))?
+    };
 
     // Cost model: static estimate for the vertical slice (no workload yet).
     let model = analyzer.cost_model(&program);
@@ -111,6 +134,9 @@ pub fn run(cli: Cli) -> Result<std::process::ExitCode, String> {
             &args.format,
             args.language.as_deref(),
             &args.fail_on,
+            &args.resolution,
+            args.pyright_executable.as_deref(),
+            args.pyright_timeout,
         )?,
         Command::Fix(args) => run_fix(args)?,
     };

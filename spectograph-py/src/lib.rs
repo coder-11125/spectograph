@@ -4,6 +4,7 @@
 
 pub mod entrypoints;
 pub mod parse;
+pub mod pyright;
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -17,6 +18,58 @@ use spectograph_core::ir::{
 
 /// Analyzer for the Python language.
 pub struct PythonAnalyzer;
+
+/// Which reference-resolution backend to use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResolutionMode {
+    /// Hand-rolled static resolver (scope, aliasing, methods, inheritance).
+    Static,
+    /// basedpyright type-aware resolver (via LSP find-references).
+    Pyright,
+}
+
+impl PythonAnalyzer {
+    /// Analyze with a resolution backend. `Static` is equivalent to [`Analyzer::analyze`].
+    pub fn analyze_with_resolution(
+        &self,
+        root: &Path,
+        resolution: ResolutionMode,
+        pyright_executable: Option<&str>,
+        timeout_ms: u64,
+    ) -> Result<Program, AnalyzeError> {
+        let mut program = Analyzer::analyze(self, root)?;
+        if resolution == ResolutionMode::Static {
+            return Ok(program);
+        }
+        // Default to `basedpyright-langserver` on PATH unless an explicit executable is
+        // given. (The npm basedpyright package ships both a CLI checker and this LSP
+        // server; we need the latter for find-references.)
+        let executable = match pyright_executable {
+            Some(e) => e.to_string(),
+            None => "basedpyright-langserver".to_string(),
+        };
+        let edges = crate::pyright::resolve_program_edges(root, &program, &executable, timeout_ms)
+            .map_err(|e| AnalyzeError::Io(std::io::Error::other(e.to_string())))?;
+        // Replace the static call-graph edges with the type-aware ones.
+        let callable: std::collections::HashSet<SymbolId> = program
+            .symbols
+            .iter()
+            .filter(|s| matches!(s.kind, SymbolKind::Function | SymbolKind::Class))
+            .map(|s| s.id)
+            .collect();
+        program.references.retain(|r| {
+            !(callable.contains(&r.from) && callable.contains(&r.to))
+        });
+        for (from, to) in edges {
+            program.references.push(Reference {
+                from,
+                to,
+                kind: RefKind::Static,
+            });
+        }
+        Ok(program)
+    }
+}
 
 impl Analyzer for PythonAnalyzer {
     fn language(&self) -> Language {
