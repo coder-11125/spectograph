@@ -53,21 +53,19 @@ Exit code is nonzero when bloat at or above `--fail-on` tier is found.
 
 ## Fixtures
 
-Real Python sample projects live under `fixtures/` (not `examples/`) and are exercised by
+Real Python sample projects live under `fixtures/python/` and are exercised by
 automated tests in `spectograph-py/tests/fixtures.rs`, which assert which symbols are
 reachable and which are dead:
 
-- `fixtures/python-sample` — entrypoint + dead code / unused imports
-- `fixtures/python-pkg` — `__init__.py` re-exports and `__all__`
-- `fixtures/python-scripts` — `pyproject.toml` console-script entrypoints
+- `fixtures/python/python-sample` — entrypoint + dead code / unused imports
+- `fixtures/python/python-pkg` — `__init__.py` re-exports and `__all__`
+- `fixtures/python/python-scripts` — `pyproject.toml` console-script entrypoints
+- `fixtures/python/python-classes` — method/attribute resolution
+- `fixtures/python/python-relative` — relative imports
+- `fixtures/python/python-inheritance` — `super()`/inheritance
 
-```sh
-cargo test -p spectograph-py --test fixtures
-```
-
-Keeping these as versioned, test-backed fixtures (rather than a gitignored `examples/`)
-ensures the Python sample code does not inflate the repo's language breakdown while still
-being load-bearing.
+Keeping these as versioned, test-backed fixtures ensures the Python sample code does not
+inflate the repo's language breakdown while still being load-bearing.
 
 ## Tests
 

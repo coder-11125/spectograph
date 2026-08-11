@@ -1,6 +1,6 @@
 //! Automated tests that run the full analyzer against the committed fixtures in
-//! `fixtures/`. Each fixture asserts which symbols must be reachable (not bloat) and
-//! which must be flagged as dead. This keeps the demo fixtures load-bearing.
+//! `fixtures/python/`. Each fixture asserts which symbols must be reachable (not bloat)
+//! and which must be flagged as dead. This keeps the demo fixtures load-bearing.
 
 use std::path::PathBuf;
 
@@ -11,7 +11,7 @@ use spectograph_py::PythonAnalyzer;
 
 /// Path to the fixtures dir relative to the crate root.
 fn fixtures_dir() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../fixtures")
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../fixtures/python")
 }
 
 fn analyze(name: &str) -> spectograph_core::ir::Program {
