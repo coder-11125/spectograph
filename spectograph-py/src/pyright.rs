@@ -253,6 +253,35 @@ fn uri_to_path(uri: &str) -> PathBuf {
         PathBuf::from(uri)
     }
 }
+/// Detect the Python interpreter path using the `VIRTUAL_ENV` environment variable
+/// or looking for a `.venv` directory in the workspace root.
+fn detect_python_path(root: &Path) -> Option<String> {
+    if let Ok(venv) = std::env::var("VIRTUAL_ENV") {
+        let p = PathBuf::from(venv);
+        let bin_p = if cfg!(windows) {
+            p.join("Scripts").join("python.exe")
+        } else {
+            p.join("bin").join("python")
+        };
+        if bin_p.exists() {
+            return Some(bin_p.to_string_lossy().into_owned());
+        }
+    }
+
+    let local_venv = root.join(".venv");
+    if local_venv.is_dir() {
+        let bin_p = if cfg!(windows) {
+            local_venv.join("Scripts").join("python.exe")
+        } else {
+            local_venv.join("bin").join("python")
+        };
+        if bin_p.exists() {
+            return Some(bin_p.to_string_lossy().into_owned());
+        }
+    }
+
+    None
+}
 
 /// Drive basedpyright and produce the type-aware reference edges.
 ///
@@ -271,7 +300,18 @@ pub fn resolve_references(
 ) -> Result<Vec<ReferenceEdge>, PyrightError> {
     let mut f = Framing::start(executable)?;
 
-    // Handshake: initialize.
+    // Handshake: initialize with detected python path if available.
+    let python_path = detect_python_path(root);
+    let initialization_options = python_path.map(|path| {
+        serde_json::json!({
+            "settings": {
+                "python": {
+                    "pythonPath": path
+                }
+            }
+        })
+    });
+
     let init_params = InitializeParams {
         process_id: None,
         workspace_folders: Some(vec![lsp_types::WorkspaceFolder {
@@ -282,6 +322,7 @@ pub fn resolve_references(
                 .unwrap_or_default(),
         }]),
         capabilities: ClientCapabilities::default(),
+        initialization_options,
         ..Default::default()
     };
     let _ = f.send_request(
@@ -315,8 +356,10 @@ pub fn resolve_references(
     // Wait for analysis to settle.
     f.wait_for_analysis(&opened_uris, timeout_ms)?;
 
-    // Query references for each symbol.
+    // Query references for each symbol using pipelining.
     let mut edges: Vec<ReferenceEdge> = Vec::new();
+    let mut pending_requests = std::collections::HashMap::new();
+
     for qs in queries {
         let td = TextDocumentIdentifier {
             uri: uri_for_abs(&qs.file),
@@ -336,42 +379,43 @@ pub fn resolve_references(
             References::METHOD,
             serde_json::to_value(&params).map_err(|e| PyrightError::Lsp(e.to_string()))?,
         )?;
-        let refs = loop {
-            let (rid, result) = f.next_request_result()?;
-            if rid == req_id {
-                break result;
-            }
-        };
+        pending_requests.insert(req_id, qs);
+    }
 
-        let mut locations: Vec<(PathBuf, usize)> = Vec::new();
-        if let Some(arr) = refs.as_array() {
-            for loc in arr {
-                if let Ok(l) = serde_json::from_value::<Location>(loc.clone()) {
-                    let path = uri_to_path(l.uri.as_str());
-                    locations.push((path, l.range.start.line as usize + 1)); // 1-based
+    // Process responses as they arrive.
+    while !pending_requests.is_empty() {
+        let (rid, result) = f.next_request_result()?;
+        if let Some(qs) = pending_requests.remove(&rid) {
+            let mut locations: Vec<(PathBuf, usize)> = Vec::new();
+            if let Some(arr) = result.as_array() {
+                for loc in arr {
+                    if let Ok(l) = serde_json::from_value::<Location>(loc.clone()) {
+                        let path = uri_to_path(l.uri.as_str());
+                        locations.push((path, l.range.start.line as usize + 1)); // 1-based
+                    }
                 }
             }
-        }
-        if std::env::var("SPECT_OGRAPH_DEBUG_PYRIGHT").is_ok() {
-            eprintln!(
-                "[pyright] query id={} file={} pos={}:{} -> {} raw references",
-                qs.id,
-                qs.file.display(),
-                qs.position.line + 1,
-                qs.position.character + 1,
-                locations.len()
-            );
-        }
-
-        // Skip the queried symbol's own definition; map the rest to enclosing symbols.
-        let def_line = qs.position.line as usize + 1;
-        for (file, line) in locations {
-            if file == qs.file && line == def_line {
-                continue; // definition itself
+            if std::env::var("SPECT_OGRAPH_DEBUG_PYRIGHT").is_ok() {
+                eprintln!(
+                    "[pyright] query id={} file={} pos={}:{} -> {} raw references",
+                    qs.id,
+                    qs.file.display(),
+                    qs.position.line + 1,
+                    qs.position.character + 1,
+                    locations.len()
+                );
             }
-            if let Some(from) = enclosing_symbol(&file, line, spans) {
-                if from != qs.id {
-                    edges.push(ReferenceEdge { from, to: qs.id });
+
+            // Skip the queried symbol's own definition; map the rest to enclosing symbols.
+            let def_line = qs.position.line as usize + 1;
+            for (file, line) in locations {
+                if file == qs.file && line == def_line {
+                    continue; // definition itself
+                }
+                if let Some(from) = enclosing_symbol(&file, line, spans) {
+                    if from != qs.id {
+                        edges.push(ReferenceEdge { from, to: qs.id });
+                    }
                 }
             }
         }
