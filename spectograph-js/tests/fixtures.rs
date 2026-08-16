@@ -5,8 +5,6 @@
 use std::path::PathBuf;
 
 use spectograph_analyzer::Analyzer;
-use spectograph_core::analysis;
-use spectograph_core::cost::CostModel;
 use spectograph_js::JavaScriptAnalyzer;
 
 /// Path to the fixtures dir relative to the crate root.
@@ -16,28 +14,30 @@ fn fixtures_dir() -> PathBuf {
 
 fn analyze(name: &str) -> spectograph_core::ir::Program {
     let dir = fixtures_dir().join(name);
-    JavaScriptAnalyzer.analyze(&dir).unwrap_or_else(|e| panic!("analyze {name}: {e}"))
-}
-
-fn report(program: &mut spectograph_core::ir::Program) -> analysis::Report {
-    let model = CostModel::build(program, spectograph_core::cost::CostSource::Estimated);
-    analysis::analyze(program, &model)
-}
-
-fn is_flagged(report: &analysis::Report, name: &str) -> bool {
-    report.findings.iter().any(|f| f.name == name)
+    JavaScriptAnalyzer
+        .analyze(&dir)
+        .unwrap_or_else(|e| panic!("analyze {name}: {e}"))
 }
 
 /// js-sample: basic parsing - check symbols exist
 #[test]
 fn js_sample_fixture() {
-    let mut program = analyze("js-sample");
+    let program = analyze("js-sample");
     // Check that symbols are created
     let symbol_names: Vec<_> = program.symbols.iter().map(|s| s.name.clone()).collect();
-    assert!(symbol_names.contains(&"main".to_string()), "main should exist");
-    assert!(symbol_names.contains(&"helper".to_string()), "helper should exist");
-    assert!(symbol_names.contains(&"unusedHelper".to_string()), "unusedHelper should exist");
-    
+    assert!(
+        symbol_names.contains(&"main".to_string()),
+        "main should exist"
+    );
+    assert!(
+        symbol_names.contains(&"helper".to_string()),
+        "helper should exist"
+    );
+    assert!(
+        symbol_names.contains(&"unusedHelper".to_string()),
+        "unusedHelper should exist"
+    );
+
     // Check that there are references
     assert!(!program.references.is_empty(), "should have references");
 }
@@ -45,21 +45,42 @@ fn js_sample_fixture() {
 /// js-pkg: basic parsing - check symbols exist
 #[test]
 fn js_pkg_fixture() {
-    let mut program = analyze("js-pkg");
+    let program = analyze("js-pkg");
     let symbol_names: Vec<_> = program.symbols.iter().map(|s| s.name.clone()).collect();
-    assert!(symbol_names.contains(&"add".to_string()), "add should exist");
-    assert!(symbol_names.contains(&"subtract".to_string()), "subtract should exist");
-    assert!(symbol_names.contains(&"multiply".to_string()), "multiply should exist");
+    assert!(
+        symbol_names.contains(&"add".to_string()),
+        "add should exist"
+    );
+    assert!(
+        symbol_names.contains(&"subtract".to_string()),
+        "subtract should exist"
+    );
+    assert!(
+        symbol_names.contains(&"multiply".to_string()),
+        "multiply should exist"
+    );
 }
 
 /// js-classes: basic parsing - check symbols exist
 #[test]
 fn js_classes_fixture() {
-    let mut program = analyze("js-classes");
+    let program = analyze("js-classes");
     let symbol_names: Vec<_> = program.symbols.iter().map(|s| s.name.clone()).collect();
-    assert!(symbol_names.contains(&"Greeter".to_string()), "Greeter should exist");
-    assert!(symbol_names.contains(&"ChildGreeter".to_string()), "ChildGreeter should exist");
+    assert!(
+        symbol_names.contains(&"Greeter".to_string()),
+        "Greeter should exist"
+    );
+    assert!(
+        symbol_names.contains(&"ChildGreeter".to_string()),
+        "ChildGreeter should exist"
+    );
     // Methods are named ClassName.methodName
-    assert!(symbol_names.iter().any(|n| n.contains("greet")), "greet method should exist");
-    assert!(symbol_names.iter().any(|n| n.contains("unusedMethod")), "unusedMethod should exist");
+    assert!(
+        symbol_names.iter().any(|n| n.contains("greet")),
+        "greet method should exist"
+    );
+    assert!(
+        symbol_names.iter().any(|n| n.contains("unusedMethod")),
+        "unusedMethod should exist"
+    );
 }

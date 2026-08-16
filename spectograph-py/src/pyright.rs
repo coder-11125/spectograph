@@ -43,7 +43,7 @@ pub enum PyrightError {
 }
 
 /// Reusable basedpyright LSP client for connection pooling (Gap #23: No Connection Reuse).
-/// 
+///
 /// This struct manages a persistent connection to a basedpyright LSP server,
 /// allowing multiple resolve_references calls to reuse the same connection.
 /// This significantly reduces overhead from process spawning, LSP handshake,
@@ -69,15 +69,15 @@ impl PyrightClient {
             initialized: false,
         })
     }
-    
+
     /// Start the LSP server connection if not already started.
     pub fn ensure_connected(&mut self) -> Result<(), PyrightError> {
         if self.framing.is_some() && self.initialized {
             return Ok(());
         }
-        
+
         let mut f = Framing::start(&self.executable)?;
-        
+
         // Initialize with detected python path
         let initialization_options = self.python_path.as_ref().map(|path| {
             serde_json::json!({
@@ -88,12 +88,13 @@ impl PyrightClient {
                 }
             })
         });
-        
+
         let init_params = InitializeParams {
             process_id: None,
             workspace_folders: Some(vec![lsp_types::WorkspaceFolder {
                 uri: uri_for_abs(&self.root),
-                name: self.root
+                name: self
+                    .root
                     .file_name()
                     .map(|n| n.to_string_lossy().into_owned())
                     .unwrap_or_default(),
@@ -109,19 +110,20 @@ impl PyrightClient {
         let _ = f.next_request_result()?;
         let _ = f.send_notification(
             Initialized::METHOD,
-            serde_json::to_value(InitializedParams {}).map_err(|e| PyrightError::Lsp(e.to_string()))?,
+            serde_json::to_value(InitializedParams {})
+                .map_err(|e| PyrightError::Lsp(e.to_string()))?,
         );
-        
+
         self.framing = Some(f);
         self.initialized = true;
         Ok(())
     }
-    
+
     /// Open a file with the LSP server.
     pub fn open_file(&mut self, path: &Path, source: &str) -> Result<Uri, PyrightError> {
         self.ensure_connected()?;
         let f = self.framing.as_mut().unwrap();
-        
+
         let uri = uri_for_abs(path);
         let item = TextDocumentItem {
             uri: uri.clone(),
@@ -129,21 +131,27 @@ impl PyrightClient {
             version: 1,
             text: source.to_string(),
         };
-        let params = DidOpenTextDocumentParams { text_document: item };
+        let params = DidOpenTextDocumentParams {
+            text_document: item,
+        };
         f.send_notification(
             DidOpenTextDocument::METHOD,
             serde_json::to_value(&params).map_err(|e| PyrightError::Lsp(e.to_string()))?,
         )?;
         Ok(uri)
     }
-    
+
     /// Wait for analysis to settle on opened files.
-    pub fn wait_for_analysis(&mut self, opened: &[String], timeout_ms: u64) -> Result<(), PyrightError> {
+    pub fn wait_for_analysis(
+        &mut self,
+        opened: &[String],
+        timeout_ms: u64,
+    ) -> Result<(), PyrightError> {
         self.ensure_connected()?;
         let f = self.framing.as_mut().unwrap();
         f.wait_for_analysis(opened, timeout_ms)
     }
-    
+
     /// Send a references request.
     pub fn send_references_request(
         &mut self,
@@ -152,7 +160,7 @@ impl PyrightClient {
     ) -> Result<i64, PyrightError> {
         self.ensure_connected()?;
         let f = self.framing.as_mut().unwrap();
-        
+
         let td = TextDocumentIdentifier {
             uri: uri_for_abs(file),
         };
@@ -172,14 +180,14 @@ impl PyrightClient {
             serde_json::to_value(&params).map_err(|e| PyrightError::Lsp(e.to_string()))?,
         )
     }
-    
+
     /// Get the next request result.
     pub fn next_request_result(&mut self) -> Result<(i64, serde_json::Value), PyrightError> {
         self.ensure_connected()?;
         let f = self.framing.as_mut().unwrap();
         f.next_request_result()
     }
-    
+
     /// Shutdown the connection.
     pub fn shutdown(&mut self) -> Result<(), PyrightError> {
         if let Some(f) = self.framing.as_mut() {
@@ -200,7 +208,7 @@ impl Drop for PyrightClient {
 }
 
 /// Incremental analysis state for caching (Gap #24: No Incremental Analysis).
-/// 
+///
 /// Tracks file hashes and analysis results to avoid re-analyzing unchanged files.
 /// Note: This is a basic implementation that can be expanded for full incremental support.
 #[derive(Debug, Clone, Default)]
@@ -217,26 +225,28 @@ impl IncrementalState {
     pub fn new() -> Self {
         Self::default()
     }
-    
+
     /// Compute hash of file content.
     pub fn compute_file_hash(content: &str) -> u64 {
         let mut hasher = DefaultHasher::new();
         content.hash(&mut hasher);
         hasher.finish()
     }
-    
+
     /// Check if file has changed based on content hash.
     pub fn file_changed(&self, path: &str, content: &str) -> bool {
         let current_hash = Self::compute_file_hash(content);
-        self.file_hashes.get(path).map_or(true, |&h| h != current_hash)
+        self.file_hashes
+            .get(path)
+            .is_none_or(|&h| h != current_hash)
     }
-    
+
     /// Update file hash in the cache.
     pub fn update_file_hash(&mut self, path: String, content: &str) {
         let hash = Self::compute_file_hash(content);
         self.file_hashes.insert(path, hash);
     }
-    
+
     /// Get cached spans for a file if available and not changed.
     pub fn get_cached_spans(&self, path: &str, content: &str) -> Option<&Vec<SymbolSpan>> {
         if self.file_changed(path, content) {
@@ -244,17 +254,17 @@ impl IncrementalState {
         }
         self.cached_spans.get(path)
     }
-    
+
     /// Cache spans for a file.
     pub fn cache_spans(&mut self, path: String, spans: Vec<SymbolSpan>) {
         self.cached_spans.insert(path, spans);
     }
-    
+
     /// Get cached edges for a symbol if available.
     pub fn get_cached_edges(&self, symbol_id: usize) -> Option<&Vec<ReferenceEdge>> {
         self.cached_edges.get(&symbol_id)
     }
-    
+
     /// Cache edges for a symbol.
     pub fn cache_edges(&mut self, symbol_id: usize, edges: Vec<ReferenceEdge>) {
         self.cached_edges.insert(symbol_id, edges);
@@ -305,32 +315,32 @@ struct SymbolSpanIndex {
 impl SymbolSpanIndex {
     fn new(spans: &[SymbolSpan]) -> Self {
         let mut file_spans: HashMap<PathBuf, Vec<(usize, usize, usize)>> = HashMap::new();
-        
+
         for span in spans {
             file_spans
                 .entry(span.file.clone())
-                .or_insert_with(Vec::new)
+                .or_default()
                 .push((span.start_line, span.end_line, span.id));
         }
-        
+
         // Sort spans by start_line for binary search
         for spans in file_spans.values_mut() {
             spans.sort_by_key(|&(start, _, _)| start);
         }
-        
+
         Self { file_spans }
     }
-    
+
     /// Find the symbol whose span contains `line` in `file`, preferring the
     /// smallest enclosing span. Fixes Gap #19 (Overlapping Spans).
     fn enclosing_symbol(&self, file: &Path, line: usize) -> Option<usize> {
         let spans = self.file_spans.get(file)?;
-        
+
         // Binary search for spans that could contain this line
         // We need spans where start_line <= line <= end_line
         // Find first span with start_line <= line
         let mut best: Option<(usize, usize)> = None; // (id, span_size)
-        
+
         for &(start, end, id) in spans {
             if line >= start && line <= end {
                 let size = end - start;
@@ -344,7 +354,7 @@ impl SymbolSpanIndex {
                 break;
             }
         }
-        
+
         best.map(|(id, _)| id)
     }
 }
@@ -413,7 +423,7 @@ impl PipelineStats {
     fn new() -> Self {
         Self::default()
     }
-    
+
     fn record_query(&mut self, duration_ms: u64, success: bool, edge_count: usize) {
         self.total_queries += 1;
         if success {
@@ -422,7 +432,7 @@ impl PipelineStats {
             self.failed_queries += 1;
         }
         self.total_edges += edge_count;
-        
+
         // Update timing stats
         if self.total_queries == 1 {
             self.min_query_time_ms = duration_ms;
@@ -432,22 +442,24 @@ impl PipelineStats {
             self.max_query_time_ms = self.max_query_time_ms.max(duration_ms);
         }
     }
-    
+
     fn record_backpressure(&mut self, wait_time_ms: u64) {
         self.backpressure_trigger_count += 1;
         self.backpressure_wait_time_ms += wait_time_ms;
     }
-    
+
     fn finalize(&mut self) {
-        if self.started_at.is_some() && self.completed_at.is_some() {
-            let total_ms = self.completed_at.unwrap().duration_since(self.started_at.unwrap()).as_millis() as u64;
+        if let (Some(started_at), Some(completed_at)) = (self.started_at, self.completed_at) {
+            let total_ms = completed_at
+                .duration_since(started_at)
+                .as_millis() as u64;
             self.total_time_ms = total_ms;
             if self.total_queries > 0 {
                 self.avg_query_time_ms = total_ms as f64 / self.total_queries as f64;
             }
         }
     }
-    
+
     /// Return a summary string of the pipeline statistics.
     pub fn summary(&self) -> String {
         format!(
@@ -475,8 +487,6 @@ struct PendingRequest {
     retry_count: usize,
     received_at: Option<Instant>, // When response was received (Gap #21: Metrics)
 }
-
-
 
 /// Minimal JSON-RPC 2.0 framing over stdio (LSP protocol).
 #[derive(Debug)]
@@ -528,7 +538,11 @@ impl Framing {
             .map_err(|e| PyrightError::Lsp(e.to_string()))
     }
 
-    fn send_request(&mut self, method: &str, params: serde_json::Value) -> Result<i64, PyrightError> {
+    fn send_request(
+        &mut self,
+        method: &str,
+        params: serde_json::Value,
+    ) -> Result<i64, PyrightError> {
         let id = self.next_id;
         self.next_id += 1;
         let msg = serde_json::json!({
@@ -541,7 +555,11 @@ impl Framing {
         Ok(id)
     }
 
-    fn send_notification(&mut self, method: &str, params: serde_json::Value) -> Result<(), PyrightError> {
+    fn send_notification(
+        &mut self,
+        method: &str,
+        params: serde_json::Value,
+    ) -> Result<(), PyrightError> {
         let msg = serde_json::json!({
             "jsonrpc": "2.0",
             "method": method,
@@ -597,10 +615,13 @@ impl Framing {
                     // Server -> client request: answer null.
                     self.send_response(id.as_i64().unwrap_or(0), serde_json::Value::Null)?;
                 } else if method == PublishDiagnostics::METHOD {
-                    if let Ok(params) = serde_json::from_value::<PublishDiagnosticsParams>(
-                        msg["params"].clone(),
-                    ) {
-                        *self.diagnostics_seen.entry(params.uri.to_string()).or_insert(0) += 1;
+                    if let Ok(params) =
+                        serde_json::from_value::<PublishDiagnosticsParams>(msg["params"].clone())
+                    {
+                        *self
+                            .diagnostics_seen
+                            .entry(params.uri.to_string())
+                            .or_insert(0) += 1;
                     }
                 }
                 continue;
@@ -609,12 +630,19 @@ impl Framing {
                 .get("id")
                 .and_then(|i| i.as_i64())
                 .ok_or_else(|| PyrightError::Lsp("response missing id".into()))?;
-            let result = msg.get("result").cloned().unwrap_or(serde_json::Value::Null);
+            let result = msg
+                .get("result")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null);
             return Ok((id, result));
         }
     }
 
-    fn wait_for_analysis(&mut self, opened: &[String], timeout_ms: u64) -> Result<(), PyrightError> {
+    fn wait_for_analysis(
+        &mut self,
+        opened: &[String],
+        timeout_ms: u64,
+    ) -> Result<(), PyrightError> {
         let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
         let mut settled = std::collections::HashSet::new();
         let mut iter = 0u32;
@@ -630,9 +658,9 @@ impl Framing {
             let msg = self.read_message()?;
             iter += 1;
             if msg.get("method").and_then(|m| m.as_str()) == Some(PublishDiagnostics::METHOD) {
-                if let Ok(params) = serde_json::from_value::<PublishDiagnosticsParams>(
-                    msg["params"].clone(),
-                ) {
+                if let Ok(params) =
+                    serde_json::from_value::<PublishDiagnosticsParams>(msg["params"].clone())
+                {
                     if std::env::var("SPECT_OGRAPH_DEBUG_PYRIGHT").is_ok() {
                         eprintln!(
                             "[pyright] diagnostics for {} ({} findings)",
@@ -652,7 +680,9 @@ fn uri_for_abs(path: &Path) -> Uri {
     let abs = if path.is_absolute() {
         path.to_path_buf()
     } else {
-        std::env::current_dir().unwrap_or_else(|_| path.to_path_buf()).join(path)
+        std::env::current_dir()
+            .unwrap_or_else(|_| path.to_path_buf())
+            .join(path)
     };
     Uri::from_str(&format!("file://{}", abs.display()))
         .unwrap_or_else(|_| Uri::from_str("file:///").unwrap())
@@ -668,7 +698,7 @@ fn uri_to_path(uri: &str) -> PathBuf {
     }
 }
 /// Detect the Python interpreter path using multiple strategies (Gap #22).
-/// 
+///
 /// Tries in order:
 /// 1. VIRTUAL_ENV environment variable
 /// 2. Common venv directory names in workspace root (.venv, venv, .python-venv, .env, env)
@@ -738,7 +768,7 @@ fn find_python_in_venv(venv_path: &Path) -> Option<String> {
     } else {
         venv_path.join("bin")
     };
-    
+
     if !bin_dir.is_dir() {
         return None;
     }
@@ -747,16 +777,23 @@ fn find_python_in_venv(venv_path: &Path) -> Option<String> {
     let candidates: &[&str] = if cfg!(windows) {
         &["python.exe", "python3.exe"]
     } else {
-        &["python3", "python", "python3.12", "python3.11", "python3.10", "python3.9"]
+        &[
+            "python3",
+            "python",
+            "python3.12",
+            "python3.11",
+            "python3.10",
+            "python3.9",
+        ]
     };
-    
+
     for candidate in candidates {
         let python_path = bin_dir.join(candidate);
         if python_path.exists() {
             return Some(python_path.to_string_lossy().into_owned());
         }
     }
-    
+
     None
 }
 
@@ -764,7 +801,7 @@ fn find_python_in_venv(venv_path: &Path) -> Option<String> {
 fn find_python_in_parent_dirs(start: &Path) -> Option<String> {
     let mut current = start.to_path_buf();
     let max_depth = 5; // Don't walk too far up
-    
+
     for _ in 0..max_depth {
         // Check if current directory has a venv
         let venv_dirs = [".venv", "venv", ".python-venv", ".env", "env"];
@@ -776,13 +813,13 @@ fn find_python_in_parent_dirs(start: &Path) -> Option<String> {
                 }
             }
         }
-        
+
         // Move up to parent
         if !current.pop() {
             break; // Reached root
         }
     }
-    
+
     None
 }
 
@@ -811,19 +848,13 @@ pub fn resolve_references(
 ) -> Result<Vec<ReferenceEdge>, PyrightError> {
     let config = PipelineConfig::default();
     resolve_references_with_config(
-        executable,
-        root,
-        files,
-        sources,
-        queries,
-        spans,
-        timeout_ms,
-        &config,
+        executable, root, files, sources, queries, spans, timeout_ms, &config,
     )
 }
 
 /// Internal implementation with pipeline configuration.
 /// This is the core function that implements gaps #1-10 fixes.
+#[allow(clippy::too_many_arguments)]
 pub fn resolve_references_with_config(
     executable: &str,
     root: &Path,
@@ -836,7 +867,7 @@ pub fn resolve_references_with_config(
 ) -> Result<Vec<ReferenceEdge>, PyrightError> {
     // Build spatial index for O(log n) span lookups (Gaps #17, #18)
     let span_index = SymbolSpanIndex::new(spans);
-    
+
     // Initialize metrics collection (Gap #21)
     let mut stats = PipelineStats::new();
     stats.started_at = Some(Instant::now());
@@ -888,7 +919,9 @@ pub fn resolve_references_with_config(
             version: 1,
             text: (*src).to_string(),
         };
-        let params = DidOpenTextDocumentParams { text_document: item };
+        let params = DidOpenTextDocumentParams {
+            text_document: item,
+        };
         f.send_notification(
             DidOpenTextDocument::METHOD,
             serde_json::to_value(&params).map_err(|e| PyrightError::Lsp(e.to_string()))?,
@@ -899,26 +932,25 @@ pub fn resolve_references_with_config(
     f.wait_for_analysis(&opened_uris, timeout_ms)?;
 
     // --- PIPELINE IMPLEMENTATION WITH FIXES FOR GAPS #1-10 ---
-    
+
     let total_queries = queries.len();
     let mut edges: Vec<ReferenceEdge> = Vec::new();
     let mut pending_requests: HashMap<i64, PendingRequest> = HashMap::new();
     let mut completed_queries: HashSet<usize> = HashSet::new();
     let mut failed_queries: HashMap<usize, String> = HashMap::new();
-    
+
     // Sort queries by priority (Gap #8: Request Prioritization)
     // Priority: entrypoint symbols first, then by name for determinism
     let sorted_queries: Vec<&QuerySymbol> = queries.iter().collect();
     // For now, keep original order; prioritization can be added when we have entrypoint info
     // This is a placeholder for future enhancement
-    
-    let emit_progress = config.emit_progress
-        || std::env::var("SPECT_OGRAPH_DEBUG_PYRIGHT").is_ok();
-    
+
+    let emit_progress = config.emit_progress || std::env::var("SPECT_OGRAPH_DEBUG_PYRIGHT").is_ok();
+
     // Track progress counters
     let mut sent_count = 0usize;
     let mut received_count = 0usize;
-    
+
     // Log pipeline start
     if emit_progress {
         eprintln!(
@@ -929,18 +961,15 @@ pub fn resolve_references_with_config(
 
     // --- PHASE 1: Send requests with backpressure (Gaps #1, #4, #10) ---
     // Send requests in batches, respecting max_concurrent
-    let query_iter = sorted_queries.into_iter().enumerate();
-    
-    for (_index, qs) in query_iter {
+    let query_iter = sorted_queries.into_iter();
+
+    for qs in query_iter {
         // Backpressure: wait if we've hit max concurrent
-        // Check pending count (including in-flight but not yet processed)
-        let pending_count = pending_requests.len();
-        
         // If we're at capacity, process some responses first to free slots
         // This implements backpressure (Gap #10)
-        while pending_count >= config.max_concurrent {
+        while pending_requests.len() >= config.max_concurrent {
             let bp_start = Instant::now();
-            
+
             match f.next_request_result() {
                 Ok((rid, result)) => {
                     received_count += 1;
@@ -978,7 +1007,7 @@ pub fn resolve_references_with_config(
             let bp_wait_ms = bp_start.elapsed().as_millis() as u64;
             stats.record_backpressure(bp_wait_ms);
         }
-        
+
         // Build and send the request
         let td = TextDocumentIdentifier {
             uri: uri_for_abs(&qs.file),
@@ -994,7 +1023,7 @@ pub fn resolve_references_with_config(
                 include_declaration: true,
             },
         };
-        
+
         match f.send_request(
             References::METHOD,
             serde_json::to_value(&params).map_err(|e| PyrightError::Lsp(e.to_string()))?,
@@ -1010,22 +1039,16 @@ pub fn resolve_references_with_config(
                         received_at: None,
                     },
                 );
-                
-                if emit_progress && sent_count % 10 == 0 {
-                    eprintln!(
-                        "[pyright] sent {}/{} queries",
-                        sent_count, total_queries
-                    );
+
+                if emit_progress && sent_count.is_multiple_of(10) {
+                    eprintln!("[pyright] sent {}/{} queries", sent_count, total_queries);
                 }
             }
             Err(e) => {
                 // Failed to send - track as failed (Gap #7: Error Recovery)
                 failed_queries.insert(qs.id, format!("send error: {}", e));
                 if emit_progress {
-                    eprintln!(
-                        "[pyright] failed to send query for symbol {}: {}",
-                        qs.id, e
-                    );
+                    eprintln!("[pyright] failed to send query for symbol {}: {}", qs.id, e);
                 }
             }
         }
@@ -1035,10 +1058,10 @@ pub fn resolve_references_with_config(
     // Note: True parallel processing (Gap #5) would require async or threading,
     // which is a larger refactor. For now, we process sequentially but with
     // proper error handling and timeout tracking.
-    
+
     while !pending_requests.is_empty() {
         let start_wait = Instant::now();
-        
+
         match f.next_request_result() {
             Ok((rid, result)) => {
                 received_count += 1;
@@ -1054,7 +1077,7 @@ pub fn resolve_references_with_config(
                     emit_progress,
                     &mut stats,
                 );
-                
+
                 if emit_progress && processed {
                     eprintln!(
                         "[pyright] pipeline progress: {}/{}",
@@ -1079,7 +1102,7 @@ pub fn resolve_references_with_config(
                 break;
             }
         }
-        
+
         // Check overall timeout for the pipeline
         // This is in addition to per-request timeout (Gap #2)
         if start_wait.elapsed() > Duration::from_millis(timeout_ms) {
@@ -1093,10 +1116,7 @@ pub fn resolve_references_with_config(
             }
             // Mark remaining as timed out
             for (_rid, pending) in pending_requests.drain() {
-                failed_queries.insert(
-                    pending.query.id,
-                    "pipeline timeout".to_string(),
-                );
+                failed_queries.insert(pending.query.id, "pipeline timeout".to_string());
             }
             break;
         }
@@ -1105,7 +1125,7 @@ pub fn resolve_references_with_config(
     // Finalize and log statistics (Gap #21: Metrics)
     stats.completed_at = Some(Instant::now());
     stats.finalize();
-    
+
     // Log pipeline summary
     if emit_progress || config.collect_metrics {
         eprintln!(
@@ -1115,15 +1135,12 @@ pub fn resolve_references_with_config(
             failed_queries.len(),
             total_queries
         );
-        
+
         // Log any failures
         for (symbol_id, error) in &failed_queries {
-            eprintln!(
-                "[pyright] query failed for symbol {}: {}",
-                symbol_id, error
-            );
+            eprintln!("[pyright] query failed for symbol {}: {}", symbol_id, error);
         }
-        
+
         // Log metrics summary if collection is enabled
         if config.collect_metrics {
             eprintln!("[pyright] {}", stats.summary());
@@ -1141,6 +1158,7 @@ pub fn resolve_references_with_config(
 /// Process a single response from the LSP server.
 /// Implements: Gap #7 (error recovery), Gap #2 (timeout check), Gap #6 (progress)
 /// Gap #21 (metrics collection)
+#[allow(clippy::too_many_arguments)]
 fn process_response(
     rid: i64,
     result: serde_json::Value,
@@ -1159,30 +1177,30 @@ fn process_response(
         None => {
             // Response for unknown request ID - should not happen
             if emit_progress {
-                eprintln!("[pyright] received response for unknown request id: {}", rid);
+                eprintln!(
+                    "[pyright] received response for unknown request id: {}",
+                    rid
+                );
             }
             return false;
         }
     };
-    
+
     // Record when we received this response (Gap #21: Metrics)
     pending.received_at = Some(Instant::now());
-    
+
     let qs = pending.query;
-    
+
     // Check per-request timeout (Gap #2)
     let request_timeout = Duration::from_millis(config.request_timeout_ms);
     if pending.sent_at.elapsed() > request_timeout {
         // Record timeout as failed query (Gap #21: Metrics)
         let duration_ms = request_timeout.as_millis() as u64;
         stats.record_query(duration_ms, false, 0);
-        
+
         failed_queries.insert(
             qs.id,
-            format!(
-                "request timeout after {}ms",
-                config.request_timeout_ms
-            ),
+            format!("request timeout after {}ms", config.request_timeout_ms),
         );
         if emit_progress {
             eprintln!(
@@ -1192,7 +1210,7 @@ fn process_response(
         }
         return true; // Count as processed
     }
-    
+
     // Parse the result
     let mut locations: Vec<(PathBuf, usize)> = Vec::new();
     if let Some(arr) = result.as_array() {
@@ -1203,35 +1221,46 @@ fn process_response(
             }
         }
     }
-    
+
     // Check for error in result
     // LSP errors come as {"error": {...}} or similar
     if result.get("error").is_some() {
-        let error_msg = result.get("error").and_then(|e| e.get("message")).and_then(|m| m.as_str()).unwrap_or("unknown error").to_string();
-        
+        let error_msg = result
+            .get("error")
+            .and_then(|e| e.get("message"))
+            .and_then(|m| m.as_str())
+            .unwrap_or("unknown error")
+            .to_string();
+
         // Record error as failed query (Gap #21: Metrics)
         let duration_ms = pending.sent_at.elapsed().as_millis() as u64;
         stats.record_query(duration_ms, false, 0);
-        
+
         // Implement retry logic (Gap #3)
         if pending.retry_count < config.max_retries {
             if emit_progress {
                 eprintln!(
                     "[pyright] query id={} failed, retry {}/{}: {}",
-                    qs.id, pending.retry_count + 1, config.max_retries, error_msg
+                    qs.id,
+                    pending.retry_count + 1,
+                    config.max_retries,
+                    error_msg
                 );
             }
             // Re-queue for retry
             // Note: This would require re-sending the request, which we can't do
             // in the current architecture. This is a limitation to address in future.
             // For now, we just track it as failed.
-            failed_queries.insert(qs.id, format!("error after {} retries: {}", pending.retry_count, error_msg));
+            failed_queries.insert(
+                qs.id,
+                format!("error after {} retries: {}", pending.retry_count, error_msg),
+            );
         } else {
             failed_queries.insert(qs.id, format!("max retries exceeded: {}", error_msg));
         }
         return true;
     }
-    
+
     if emit_progress {
         eprintln!(
             "[pyright] query id={} file={} pos={}:{} -> {} raw references",
@@ -1247,7 +1276,7 @@ fn process_response(
     // Use spatial index for O(log n) lookups (Gaps #17, #18, #19)
     let def_line = qs.position.line as usize + 1;
     let mut query_edges = Vec::new();
-    
+
     for (file, line) in locations {
         if file == qs.file && line == def_line {
             continue; // definition itself
@@ -1259,24 +1288,22 @@ fn process_response(
             }
         }
     }
-    
+
     // Deduplicate edges (Gap #15)
     // Remove duplicate edges that might have been added from multiple reference locations
     let mut seen_edges: HashSet<(usize, usize)> = HashSet::new();
     query_edges.retain(|e| seen_edges.insert((e.from, e.to)));
-    
+
     // Record successful query with metrics (Gap #21)
     let received_at = pending.received_at.unwrap_or_else(Instant::now);
     let duration_ms = received_at.duration_since(pending.sent_at).as_millis() as u64;
     stats.record_query(duration_ms, true, query_edges.len());
-    
+
     // Successfully processed
     edges.extend(query_edges);
     completed_queries.insert(qs.id);
     true
 }
-
-
 
 /// High-level orchestration: given a statically-built [`Program`], query basedpyright
 /// for the type-aware reference edges between its function/class symbols.
@@ -1289,24 +1316,27 @@ pub fn resolve_program_edges(
     executable: &str,
     timeout_ms: u64,
 ) -> Result<Vec<(usize, usize)>, PyrightError> {
-    use spectograph_core::ir::{Language, SymbolKind};
     use lsp_types::Position;
+    use spectograph_core::ir::{Language, SymbolKind};
 
     // Discover and read source files; normalize to absolute paths so that symbol.file,
     // opened uris, and returned reference locations all agree.
-    let files: Vec<PathBuf> = spectograph_analyzer::discover::discover_files(root, Language::Python)
-        .map_err(|e| PyrightError::Lsp(format!("discover {root:?}: {e}")))?;
+    let files: Vec<PathBuf> =
+        spectograph_analyzer::discover::discover_files(root, Language::Python)
+            .map_err(|e| PyrightError::Lsp(format!("discover {root:?}: {e}")))?;
     // discover_files returns paths already prefixed with the (possibly relative) root.
     // Make them absolute against the current working directory, without doubling root.
     let abs_of = |p: &Path| -> PathBuf {
         if p.is_absolute() {
             p.to_path_buf()
         } else {
-            std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")).join(p)
+            std::env::current_dir()
+                .unwrap_or_else(|_| PathBuf::from("."))
+                .join(p)
         }
     };
     let abs_files: Vec<PathBuf> = files.iter().map(|f| abs_of(f)).collect();
-    
+
     // Parallel file reading (Gap #12: No Parallel File Opening)
     // Use Rayon to read files in parallel, which can significantly speed up
     // I/O-bound operations on SSDs or network storage.
@@ -1317,7 +1347,7 @@ pub fn resolve_program_edges(
                 .map_err(|e| PyrightError::Lsp(format!("read {}: {e}", f.display())))
         })
         .collect();
-    
+
     let mut sources = Vec::with_capacity(abs_files.len());
     for result in source_results {
         sources.push(result?);
@@ -1335,16 +1365,15 @@ pub fn resolve_program_edges(
         // Also includes Const which covers module-level constants and variables.
         let should_query = matches!(
             sym.kind,
-            SymbolKind::Function | 
-            SymbolKind::Class | 
-            SymbolKind::Const
+            SymbolKind::Function | SymbolKind::Class | SymbolKind::Const
         );
-        
+
         if should_query {
             let file = abs_of(&sym.file);
             // Pyright needs the position on the symbol's *name*, not the node start
             // (which is `def`/`class`). Find the name in the definition line.
-            let name_col = find_name_column_with_validation(&file, sym.span.start_line, &sym.name, sym.id);
+            let name_col =
+                find_name_column_with_validation(&file, sym.span.start_line, &sym.name, sym.id);
             queries.push(QuerySymbol {
                 id: sym.id,
                 file,
@@ -1361,23 +1390,34 @@ pub fn resolve_program_edges(
         .symbols
         .iter()
         .filter(|s| s.kind != SymbolKind::Module)
-        .map(|s| {
-            SymbolSpan {
-                id: s.id,
-                file: abs_of(&s.file),
-                start_line: s.span.start_line,
-                end_line: s.span.end_line,
-            }
+        .map(|s| SymbolSpan {
+            id: s.id,
+            file: abs_of(&s.file),
+            start_line: s.span.start_line,
+            end_line: s.span.end_line,
         })
         .collect();
 
-    let edges = resolve_references(executable, root, &abs_files, &source_refs, &queries, &spans, timeout_ms)?;
+    let edges = resolve_references(
+        executable,
+        root,
+        &abs_files,
+        &source_refs,
+        &queries,
+        &spans,
+        timeout_ms,
+    )?;
     Ok(edges.into_iter().map(|e| (e.from, e.to)).collect())
 }
 
 /// Find name column with validation logging.
 /// Logs a warning when the name cannot be found at the expected position.
-fn find_name_column_with_validation(file: &Path, line: usize, name: &str, symbol_id: usize) -> usize {
+fn find_name_column_with_validation(
+    file: &Path,
+    line: usize,
+    name: &str,
+    symbol_id: usize,
+) -> usize {
     if let Ok(src) = std::fs::read_to_string(file) {
         if let Some(src_line) = src.lines().nth(line.saturating_sub(1)) {
             if let Some(idx) = src_line.find(name) {
@@ -1428,9 +1468,24 @@ mod tests {
     fn symbol_span_index_picks_smallest_containing_span() {
         // Test the new spatial index
         let spans = vec![
-            SymbolSpan { id: 1, file: PathBuf::from("a.py"), start_line: 1, end_line: 20 },
-            SymbolSpan { id: 2, file: PathBuf::from("a.py"), start_line: 5, end_line: 10 },
-            SymbolSpan { id: 3, file: PathBuf::from("b.py"), start_line: 1, end_line: 5 },
+            SymbolSpan {
+                id: 1,
+                file: PathBuf::from("a.py"),
+                start_line: 1,
+                end_line: 20,
+            },
+            SymbolSpan {
+                id: 2,
+                file: PathBuf::from("a.py"),
+                start_line: 5,
+                end_line: 10,
+            },
+            SymbolSpan {
+                id: 3,
+                file: PathBuf::from("b.py"),
+                start_line: 1,
+                end_line: 5,
+            },
         ];
         let index = SymbolSpanIndex::new(&spans);
         assert_eq!(index.enclosing_symbol(&PathBuf::from("a.py"), 7), Some(2));

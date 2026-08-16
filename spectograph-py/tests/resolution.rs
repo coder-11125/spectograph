@@ -50,7 +50,10 @@ if __name__ == "__main__":
     )]);
     let report = report(&mut program);
     // The module `helper` is referenced nowhere reachable, so it's bloat (unused).
-    assert!(find(&report, "helper").is_some(), "shadowed helper should be unused");
+    assert!(
+        find(&report, "helper").is_some(),
+        "shadowed helper should be unused"
+    );
 }
 
 /// `from utils import helper as h; h()` must make `helper` reachable through the alias.
@@ -64,7 +67,10 @@ fn aliased_import_keeps_target_reachable() {
         ("utils.py", "def helper():\n    return 2\n"),
     ]);
     let report = report(&mut program);
-    assert!(find(&report, "helper").is_none(), "helper should be used via alias");
+    assert!(
+        find(&report, "helper").is_none(),
+        "helper should be used via alias"
+    );
     // The alias import binding should exist.
     let import = program
         .symbols
@@ -125,7 +131,10 @@ fn star_import_is_uncertain_not_false_static() {
         .iter()
         .find(|s| s.name == "anything")
         .expect("anything symbol");
-    assert!(!anything.reachable, "star-imported symbol must not be statically reachable");
+    assert!(
+        !anything.reachable,
+        "star-imported symbol must not be statically reachable"
+    );
 }
 
 /// A method called only via `self.method()` inside another method stays reachable.
@@ -149,8 +158,14 @@ fn self_method_call_keeps_method_reachable() {
     )]);
     let report = report(&mut program);
     assert!(find(&report, "run").is_none(), "run should be reachable");
-    assert!(find(&report, "step").is_none(), "step via self.step() should be reachable");
-    assert!(find(&report, "dead").is_some(), "dead method should be bloat");
+    assert!(
+        find(&report, "step").is_none(),
+        "step via self.step() should be reachable"
+    );
+    assert!(
+        find(&report, "dead").is_some(),
+        "dead method should be bloat"
+    );
 }
 
 /// A method called only via `obj.method()` where obj is a local instance is reachable.
@@ -170,7 +185,10 @@ fn obj_method_call_keeps_method_reachable() {
         ),
     )]);
     let report = report(&mut program);
-    assert!(find(&report, "handle").is_none(), "handle via b.handle() should be reachable");
+    assert!(
+        find(&report, "handle").is_none(),
+        "handle via b.handle() should be reachable"
+    );
 }
 
 /// Cross-file usage through a plain module import must keep the target reachable.
@@ -184,6 +202,9 @@ fn cross_file_import_keeps_target_reachable() {
         ("utils.py", "def helper():\n    return 2\n"),
     ]);
     let report = report(&mut program);
-    assert!(find(&report, "helper").is_none(), "helper should be reachable");
+    assert!(
+        find(&report, "helper").is_none(),
+        "helper should be reachable"
+    );
     let _ = Path::new("");
 }

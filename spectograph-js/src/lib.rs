@@ -10,10 +10,8 @@ use std::path::Path;
 
 use entrypoints::detect_entrypoint_symbols;
 use parse::parse_file;
-use spectograph_analyzer::{Analyzer, AnalyzeError, discover};
-use spectograph_core::ir::{
-    Language, Program, Reference, RefKind, SymbolId, SymbolKind,
-};
+use spectograph_analyzer::{discover, AnalyzeError, Analyzer};
+use spectograph_core::ir::{Language, Program, RefKind, Reference, SymbolId, SymbolKind};
 
 /// Analyzer for the JavaScript language.
 pub struct JavaScriptAnalyzer;
@@ -116,18 +114,22 @@ impl Analyzer for JavaScriptAnalyzer {
         for (_path, result) in &parsed {
             for imp in &result.imports {
                 // Resolve the source module
-                let source_path = result.symbols.iter()
+                let source_path = result
+                    .symbols
+                    .iter()
                     .find(|s| s.kind == SymbolKind::Module)
                     .map(|s| s.file.parent().unwrap_or(&s.file))
                     .map(|p| p.join(&imp.source))
                     .unwrap_or_else(|| root.join(&imp.source));
-                
+
                 let source_path_str = source_path.to_string_lossy().into_owned();
-                
+
                 // Find the target module in module_paths
                 if let Some(&target_module_id) = module_paths.get(&source_path_str) {
                     // Look up the imported name in the target module
-                    if let Some(&def_id) = name_in_module.get(&(target_module_id, imp.local_name.clone())) {
+                    if let Some(&def_id) =
+                        name_in_module.get(&(target_module_id, imp.local_name.clone()))
+                    {
                         program.references.push(Reference {
                             from: imp.symbol_id,
                             to: def_id,

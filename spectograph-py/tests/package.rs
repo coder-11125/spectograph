@@ -43,7 +43,10 @@ fn init_py_reexport_keeps_member_reachable() {
         ("main.py", "from pkg import add\ndef main():\n    return add(1,2)\nif __name__ == '__main__':\n    main()\n"),
     ]);
     let report = report(&mut program);
-    assert!(find(&report, "add").is_none(), "add should be reachable via re-export");
+    assert!(
+        find(&report, "add").is_none(),
+        "add should be reachable via re-export"
+    );
     assert!(
         find(&report, "unused").is_some(),
         "unused non-exported member should be bloat"
@@ -59,7 +62,10 @@ fn all_protects_public_members_only() {
         "__all__ = ['exported']\ndef exported():\n    return 2\ndef private():\n    return 3\n",
     )]);
     let report = report(&mut program);
-    assert!(is_export(&program, "exported"), "exported should have an Export symbol");
+    assert!(
+        is_export(&program, "exported"),
+        "exported should have an Export symbol"
+    );
     assert!(
         find(&report, "exported").is_none(),
         "__all__ member should not be bloat"
@@ -84,7 +90,10 @@ fn all_links_export_to_definition() {
         .iter()
         .find(|s| s.name == "helper" && s.kind == SymbolKind::Function)
         .expect("helper def");
-    assert!(helper.reachable, "helper behind __all__ should be reachable");
+    assert!(
+        helper.reachable,
+        "helper behind __all__ should be reachable"
+    );
 }
 
 /// A member re-exported in `__init__.py` but defined in a submodule is reachable and
@@ -97,7 +106,10 @@ fn package_level_dead_code_found() {
         ("main.py", "from pkg import to_upper\ndef main():\n    return to_upper('hi')\nif __name__ == '__main__':\n    main()\n"),
     ]);
     let report = report(&mut program);
-    assert!(find(&report, "to_upper").is_none(), "to_upper should be reachable");
+    assert!(
+        find(&report, "to_upper").is_none(),
+        "to_upper should be reachable"
+    );
     assert!(
         find(&report, "dead_string_fn").is_some(),
         "dead_string_fn should be flagged as package-level dead code"

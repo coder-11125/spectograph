@@ -1,6 +1,5 @@
 //! Tests for JavaScript entrypoint detection.
 
-use std::path::PathBuf;
 use tempfile::tempdir;
 
 use spectograph_js::entrypoints::detect_from_package_json;
@@ -9,11 +8,7 @@ use spectograph_js::entrypoints::detect_from_package_json;
 fn package_json_main_field() {
     let dir = tempdir().unwrap();
     let pkg_path = dir.path().join("package.json");
-    std::fs::write(
-        &pkg_path,
-        r#"{"name": "test", "main": "index.js"}"#,
-    )
-    .unwrap();
+    std::fs::write(&pkg_path, r#"{"name": "test", "main": "index.js"}"#).unwrap();
 
     let entrypoints = detect_from_package_json(dir.path()).unwrap();
     assert_eq!(entrypoints.len(), 1);
@@ -24,11 +19,7 @@ fn package_json_main_field() {
 fn package_json_bin_string() {
     let dir = tempdir().unwrap();
     let pkg_path = dir.path().join("package.json");
-    std::fs::write(
-        &pkg_path,
-        r#"{"name": "test", "bin": "cli.js"}"#,
-    )
-    .unwrap();
+    std::fs::write(&pkg_path, r#"{"name": "test", "bin": "cli.js"}"#).unwrap();
 
     let entrypoints = detect_from_package_json(dir.path()).unwrap();
     assert_eq!(entrypoints.len(), 1);

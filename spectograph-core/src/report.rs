@@ -74,7 +74,9 @@ pub fn render_human(report: &Report, show_used: bool) -> String {
     let mut out = String::new();
     out.push_str(&format!(
         "Symbols: {} total, {} reachable, {} bloat\n",
-        report.total_symbols, report.reachable_symbols, report.findings.len()
+        report.total_symbols,
+        report.reachable_symbols,
+        report.findings.len()
     ));
 
     if report.findings.is_empty() {
@@ -88,8 +90,7 @@ pub fn render_human(report: &Report, show_used: bool) -> String {
         (BloatTier::Probable, "🟠"),
         (BloatTier::HighCost, "🟡"),
     ] {
-        let items: Vec<&BloatFinding> =
-            report.findings.iter().filter(|f| f.tier == tier).collect();
+        let items: Vec<&BloatFinding> = report.findings.iter().filter(|f| f.tier == tier).collect();
         if items.is_empty() {
             continue;
         }

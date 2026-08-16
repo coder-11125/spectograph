@@ -68,7 +68,10 @@ pub fn compute_reachability(program: &mut Program) {
         for r in program.outgoing(id) {
             // Traverse static and re-export edges; dynamic edges cannot be trusted
             // for reachability and are handled by uncertainty/analysis instead.
-            if !matches!(r.kind, RefKind::Dynamic | RefKind::Reflection | RefKind::StringKeyed) {
+            if !matches!(
+                r.kind,
+                RefKind::Dynamic | RefKind::Reflection | RefKind::StringKeyed
+            ) {
                 queue.push_back(r.to);
             }
         }
@@ -132,9 +135,11 @@ pub fn analyze(program: &mut Program, model: &CostModel) -> Report {
 
     // Sort by tier (most certain first), then by score desc within tier.
     findings.sort_by(|a, b| {
-        a.tier
-            .cmp(&b.tier)
-            .then(b.bloat_score.partial_cmp(&a.bloat_score).unwrap_or(std::cmp::Ordering::Equal))
+        a.tier.cmp(&b.tier).then(
+            b.bloat_score
+                .partial_cmp(&a.bloat_score)
+                .unwrap_or(std::cmp::Ordering::Equal),
+        )
     });
 
     Report {

@@ -11,10 +11,8 @@ use std::path::Path;
 
 use entrypoints::scripts_from_pyproject;
 use parse::parse_file;
-use spectograph_analyzer::{Analyzer, AnalyzeError, discover};
-use spectograph_core::ir::{
-    Language, Program, Reference, RefKind, Symbol, SymbolId, SymbolKind,
-};
+use spectograph_analyzer::{discover, AnalyzeError, Analyzer};
+use spectograph_core::ir::{Language, Program, RefKind, Reference, Symbol, SymbolId, SymbolKind};
 
 /// Analyzer for the Python language.
 pub struct PythonAnalyzer;
@@ -57,9 +55,9 @@ impl PythonAnalyzer {
             .filter(|s| matches!(s.kind, SymbolKind::Function | SymbolKind::Class))
             .map(|s| s.id)
             .collect();
-        program.references.retain(|r| {
-            !(callable.contains(&r.from) && callable.contains(&r.to))
-        });
+        program
+            .references
+            .retain(|r| !(callable.contains(&r.from) && callable.contains(&r.to)));
         for (from, to) in edges {
             program.references.push(Reference {
                 from,
@@ -192,16 +190,14 @@ impl Analyzer for PythonAnalyzer {
             });
 
             let def_id = match decl_info {
-                Some((importing_module, decl)) => {
-                    resolve_import_target(
-                        &module_paths,
-                        &name_in_module,
-                        &sym.name,
-                        importing_module,
-                        decl,
-                    )
-                    .or_else(|| def_index.get(&sym.name).copied())
-                }
+                Some((importing_module, decl)) => resolve_import_target(
+                    &module_paths,
+                    &name_in_module,
+                    &sym.name,
+                    importing_module,
+                    decl,
+                )
+                .or_else(|| def_index.get(&sym.name).copied()),
                 None => def_index.get(&sym.name).copied(),
             };
 
@@ -225,7 +221,10 @@ impl Analyzer for PythonAnalyzer {
                 .symbol(module_id)
                 .map(|s| s.file.clone())
                 .unwrap_or_default();
-            let is_pkg_root = module_file.file_name().map(|n| n == "__init__.py").unwrap_or(false);
+            let is_pkg_root = module_file
+                .file_name()
+                .map(|n| n == "__init__.py")
+                .unwrap_or(false);
 
             // In `__init__.py`, top-level imports ARE re-exports (public API), so
             // reaching the package root reaches them. In ordinary modules an import is
@@ -362,7 +361,9 @@ fn resolve_import_target(
         return None;
     }
     let target_module = module_paths.get(&target)?;
-    name_in_module.get(&(*target_module, name.to_string())).copied()
+    name_in_module
+        .get(&(*target_module, name.to_string()))
+        .copied()
 }
 
 /// Compute the dotted module path a relative import refers to.

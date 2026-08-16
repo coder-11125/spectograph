@@ -102,7 +102,10 @@ fn run_check(
     match format {
         "json" => {
             let json = JsonReport::from_report(&report);
-            println!("{}", serde_json::to_string_pretty(&json).map_err(|e| e.to_string())?);
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&json).map_err(|e| e.to_string())?
+            );
         }
         _ => {
             print!("{}", report::render_human(&report, false));
@@ -110,10 +113,7 @@ fn run_check(
     }
 
     let min_tier = tier_from_str(fail_on)?;
-    let violated = report
-        .findings
-        .iter()
-        .any(|f| f.tier >= min_tier);
+    let violated = report.findings.iter().any(|f| f.tier >= min_tier);
     Ok(if violated { 1 } else { 0 })
 }
 

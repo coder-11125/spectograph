@@ -36,12 +36,24 @@ fn console_script_entrypoint_reaches_code() {
             "[project]\nname = \"x\"\n[project.scripts]\nmycli = \"pkg.cli:run\"\n",
         ),
         ("pkg/__init__.py", ""),
-        ("pkg/cli.py", "from .core import do_work\ndef run():\n    return do_work()\n"),
-        ("pkg/core.py", "def do_work():\n    return 1\ndef dead():\n    return 2\n"),
+        (
+            "pkg/cli.py",
+            "from .core import do_work\ndef run():\n    return do_work()\n",
+        ),
+        (
+            "pkg/core.py",
+            "def do_work():\n    return 1\ndef dead():\n    return 2\n",
+        ),
     ]);
     let report = report(&mut program);
-    assert!(find(&report, "run").is_none(), "script entrypoint run should not be bloat");
-    assert!(find(&report, "do_work").is_none(), "do_work reached via run should be reachable");
+    assert!(
+        find(&report, "run").is_none(),
+        "script entrypoint run should not be bloat"
+    );
+    assert!(
+        find(&report, "do_work").is_none(),
+        "do_work reached via run should be reachable"
+    );
     assert!(
         find(&report, "dead").is_some(),
         "dead function in same module should be bloat"
@@ -60,7 +72,10 @@ fn gui_script_entrypoint_reaches_code() {
         ("pkg/gui.py", "def main():\n    return 'gui'\n"),
     ]);
     let report = report(&mut program);
-    assert!(find(&report, "main").is_none(), "gui script entrypoint main should not be bloat");
+    assert!(
+        find(&report, "main").is_none(),
+        "gui script entrypoint main should not be bloat"
+    );
 }
 
 /// A script pointing at a function that only reaches part of a module keeps the rest dead.
@@ -78,7 +93,10 @@ fn script_entrypoint_does_not_mark_whole_module_used() {
         ),
     ]);
     let report = report(&mut program);
-    assert!(find(&report, "run").is_none(), "entrypoint run should be reachable");
+    assert!(
+        find(&report, "run").is_none(),
+        "entrypoint run should be reachable"
+    );
     assert!(
         find(&report, "unreferenced").is_some(),
         "unreferenced function should still be bloat"
@@ -92,6 +110,9 @@ fn missing_or_malformed_pyproject_is_harmless() {
     let program = analyze(&[("pkg/a.py", "def f():\n    return 1\n")]);
     assert!(program.entrypoints.is_empty() || program.entrypoints.len() == 1);
     // Malformed toml.
-    let program2 = analyze(&[("pyproject.toml", "not [valid toml at all\n"), ("pkg/a.py", "def g():\n    return 2\n")]);
+    let program2 = analyze(&[
+        ("pyproject.toml", "not [valid toml at all\n"),
+        ("pkg/a.py", "def g():\n    return 2\n"),
+    ]);
     let _ = program2;
 }

@@ -63,9 +63,10 @@ function bar() {
         .map(|s| s.id)
         .unwrap();
 
-    let has_ref = program.references.iter().any(|r| {
-        r.to == foo_id && r.from != foo_id
-    });
+    let has_ref = program
+        .references
+        .iter()
+        .any(|r| r.to == foo_id && r.from != foo_id);
     assert!(has_ref, "bar should reference foo");
 }
 
@@ -82,5 +83,8 @@ console.log(x);"#,
     )]);
 
     let x_symbols: Vec<_> = program.symbols.iter().filter(|s| s.name == "x").collect();
-    assert!(!x_symbols.is_empty(), "should have at least 1 'x' symbol (global)");
+    assert!(
+        !x_symbols.is_empty(),
+        "should have at least 1 'x' symbol (global)"
+    );
 }

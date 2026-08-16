@@ -4,9 +4,7 @@ use std::path::PathBuf;
 
 use spectograph_core::analysis::{self, BloatTier};
 use spectograph_core::cost::CostModel;
-use spectograph_core::ir::{
-    Language, Program, RefKind, Reference, SourceSpan, Symbol, SymbolKind,
-};
+use spectograph_core::ir::{Language, Program, RefKind, Reference, SourceSpan, Symbol, SymbolKind};
 
 fn sym(id: usize, name: &str, kind: SymbolKind) -> Symbol {
     Symbol {
@@ -33,9 +31,21 @@ fn program() -> Program {
             sym(5, "d", SymbolKind::Function),
         ],
         references: vec![
-            Reference { from: 0, to: 1, kind: RefKind::Static },
-            Reference { from: 1, to: 2, kind: RefKind::Static },
-            Reference { from: 4, to: 5, kind: RefKind::ReExport },
+            Reference {
+                from: 0,
+                to: 1,
+                kind: RefKind::Static,
+            },
+            Reference {
+                from: 1,
+                to: 2,
+                kind: RefKind::Static,
+            },
+            Reference {
+                from: 4,
+                to: 5,
+                kind: RefKind::ReExport,
+            },
         ],
         entrypoints: vec![0],
         reachable: Vec::new(),
@@ -59,7 +69,11 @@ fn orphan_symbol_is_guaranteed_bloat() {
     let mut p = program();
     let model = CostModel::build(&p, spectograph_core::cost::CostSource::Estimated);
     let report = analysis::analyze(&mut p, &model);
-    let c = report.findings.iter().find(|f| f.name == "c").expect("c finding");
+    let c = report
+        .findings
+        .iter()
+        .find(|f| f.name == "c")
+        .expect("c finding");
     assert_eq!(c.tier, BloatTier::Guaranteed);
 }
 
@@ -68,6 +82,10 @@ fn reexport_only_symbol_is_probable_bloat() {
     let mut p = program();
     let model = CostModel::build(&p, spectograph_core::cost::CostSource::Estimated);
     let report = analysis::analyze(&mut p, &model);
-    let d = report.findings.iter().find(|f| f.name == "d").expect("d finding");
+    let d = report
+        .findings
+        .iter()
+        .find(|f| f.name == "d")
+        .expect("d finding");
     assert_eq!(d.tier, BloatTier::Probable);
 }

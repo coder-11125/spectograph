@@ -94,16 +94,11 @@ fn symbol(id: SymbolId, name: &str, kind: SymbolKind, path: &Path, node: Node) -
 }
 
 /// Parse a single JavaScript file.
-pub fn parse_file(
-    path: &Path,
-    src: &str,
-    module_id: SymbolId,
-    next_id: &mut usize,
-) -> FileResult {
+pub fn parse_file(path: &Path, src: &str, module_id: SymbolId, next_id: &mut usize) -> FileResult {
     let mut parser = Parser::new();
     let lang = tree_sitter_javascript::LANGUAGE.into();
     parser.set_language(&lang).expect("javascript grammar");
-    
+
     let tree = parser.parse(src, None).expect("parse javascript");
     let root = tree.root_node();
 
@@ -112,12 +107,31 @@ pub fn parse_file(
     let mut refs = Vec::new();
     let mut imports = Vec::new();
 
-    symbols.push(symbol(module_id, &path.to_string_lossy(), SymbolKind::Module, path, root));
-    
-    collect_globals(root, path, src, next_id, &mut symbols, &mut scopes, &mut imports);
+    symbols.push(symbol(
+        module_id,
+        &path.to_string_lossy(),
+        SymbolKind::Module,
+        path,
+        root,
+    ));
+
+    collect_globals(
+        root,
+        path,
+        src,
+        next_id,
+        &mut symbols,
+        &mut scopes,
+        &mut imports,
+    );
     collect_refs(root, src, module_id, &mut scopes, &mut refs);
 
-    FileResult { module_id, symbols, refs, imports }
+    FileResult {
+        module_id,
+        symbols,
+        refs,
+        imports,
+    }
 }
 
 fn collect_globals(
@@ -135,7 +149,8 @@ fn collect_globals(
             "function_declaration" => {
                 if let Some(name_node) = child.child_by_field_name("name") {
                     let name = node_text(name_node, src.as_bytes()).to_string();
-                    let id = *next_id; *next_id += 1;
+                    let id = *next_id;
+                    *next_id += 1;
                     scopes.declare(&name, Binding::Global(id));
                     symbols.push(symbol(id, &name, SymbolKind::Function, path, child));
                 }
@@ -147,7 +162,8 @@ fn collect_globals(
                         "function_declaration" => {
                             if let Some(name_node) = decl.child_by_field_name("name") {
                                 let name = node_text(name_node, src.as_bytes()).to_string();
-                                let id = *next_id; *next_id += 1;
+                                let id = *next_id;
+                                *next_id += 1;
                                 scopes.declare(&name, Binding::Global(id));
                                 symbols.push(symbol(id, &name, SymbolKind::Function, path, decl));
                             }
@@ -155,7 +171,8 @@ fn collect_globals(
                         "class_declaration" => {
                             if let Some(name_node) = decl.child_by_field_name("name") {
                                 let name = node_text(name_node, src.as_bytes()).to_string();
-                                let id = *next_id; *next_id += 1;
+                                let id = *next_id;
+                                *next_id += 1;
                                 scopes.declare(&name, Binding::Global(id));
                                 symbols.push(symbol(id, &name, SymbolKind::Class, path, decl));
                             }
@@ -166,9 +183,16 @@ fn collect_globals(
                                 if d.kind() == "variable_declarator" {
                                     if let Some(name_node) = d.child_by_field_name("name") {
                                         let name = node_text(name_node, src.as_bytes()).to_string();
-                                        let id = *next_id; *next_id += 1;
+                                        let id = *next_id;
+                                        *next_id += 1;
                                         scopes.declare(&name, Binding::Global(id));
-                                        symbols.push(symbol(id, &name, SymbolKind::Const, path, name_node));
+                                        symbols.push(symbol(
+                                            id,
+                                            &name,
+                                            SymbolKind::Const,
+                                            path,
+                                            name_node,
+                                        ));
                                     }
                                 }
                             }
@@ -182,10 +206,11 @@ fn collect_globals(
             "class_declaration" => {
                 if let Some(name_node) = child.child_by_field_name("name") {
                     let name = node_text(name_node, src.as_bytes()).to_string();
-                    let id = *next_id; *next_id += 1;
+                    let id = *next_id;
+                    *next_id += 1;
                     scopes.declare(&name, Binding::Global(id));
                     symbols.push(symbol(id, &name, SymbolKind::Class, path, child));
-                    
+
                     // Also parse methods inside the class body
                     if let Some(body) = child.child_by_field_name("body") {
                         let mut bc = body.walk();
@@ -193,11 +218,19 @@ fn collect_globals(
                             if method.kind() == "method_definition" {
                                 if let Some(method_name_node) = method.child_by_field_name("name") {
                                     // Use class_name.method_name for the full identifier
-                                    let method_name = node_text(method_name_node, src.as_bytes()).to_string();
+                                    let method_name =
+                                        node_text(method_name_node, src.as_bytes()).to_string();
                                     let full_name = format!("{}.{}", name, method_name);
-                                    let method_id = *next_id; *next_id += 1;
+                                    let method_id = *next_id;
+                                    *next_id += 1;
                                     scopes.declare(&method_name, Binding::Global(method_id));
-                                    symbols.push(symbol(method_id, &full_name, SymbolKind::Function, path, method));
+                                    symbols.push(symbol(
+                                        method_id,
+                                        &full_name,
+                                        SymbolKind::Function,
+                                        path,
+                                        method,
+                                    ));
                                 }
                             }
                         }
@@ -210,7 +243,8 @@ fn collect_globals(
                     if decl.kind() == "variable_declarator" {
                         if let Some(name_node) = decl.child_by_field_name("name") {
                             let name = node_text(name_node, src.as_bytes()).to_string();
-                            let id = *next_id; *next_id += 1;
+                            let id = *next_id;
+                            *next_id += 1;
                             scopes.declare(&name, Binding::Global(id));
                             symbols.push(symbol(id, &name, SymbolKind::Const, path, name_node));
                         }
@@ -218,7 +252,8 @@ fn collect_globals(
                 }
             }
             "import_statement" => {
-                let mut source = child.child_by_field_name("source")
+                let mut source = child
+                    .child_by_field_name("source")
                     .map(|s| node_text(s, src.as_bytes()).to_string())
                     .unwrap_or_default();
                 if source.is_empty() {
@@ -228,8 +263,10 @@ fn collect_globals(
                         }
                     }
                 }
-                if source.is_empty() { continue; }
-                
+                if source.is_empty() {
+                    continue;
+                }
+
                 let import_clause = child.child_by_field_name("import_clause");
                 if let Some(clause) = import_clause {
                     let mut c = clause.walk();
@@ -238,20 +275,38 @@ fn collect_globals(
                             "identifier" => {
                                 let name = node_text(n, src.as_bytes()).to_string();
                                 if !name.is_empty() {
-                                    let id = *next_id; *next_id += 1;
+                                    let id = *next_id;
+                                    *next_id += 1;
                                     scopes.declare(&name, Binding::Global(id));
                                     symbols.push(symbol(id, &name, SymbolKind::Import, path, n));
-                                    imports.push(ImportDecl { symbol_id: id, local_name: name.clone(), source: source.clone(), is_default: true });
+                                    imports.push(ImportDecl {
+                                        symbol_id: id,
+                                        local_name: name.clone(),
+                                        source: source.clone(),
+                                        is_default: true,
+                                    });
                                 }
                             }
                             "namespace_import" => {
                                 if let Some(name_node) = n.child_by_field_name("name") {
                                     let name = node_text(name_node, src.as_bytes()).to_string();
                                     if !name.is_empty() {
-                                        let id = *next_id; *next_id += 1;
+                                        let id = *next_id;
+                                        *next_id += 1;
                                         scopes.declare(&name, Binding::Global(id));
-                                        symbols.push(symbol(id, &name, SymbolKind::Import, path, name_node));
-                                        imports.push(ImportDecl { symbol_id: id, local_name: name.clone(), source: source.clone(), is_default: false });
+                                        symbols.push(symbol(
+                                            id,
+                                            &name,
+                                            SymbolKind::Import,
+                                            path,
+                                            name_node,
+                                        ));
+                                        imports.push(ImportDecl {
+                                            symbol_id: id,
+                                            local_name: name.clone(),
+                                            source: source.clone(),
+                                            is_default: false,
+                                        });
                                     }
                                 }
                             }
@@ -259,15 +314,32 @@ fn collect_globals(
                                 let mut nc = n.walk();
                                 for imp in n.named_children(&mut nc) {
                                     if imp.kind() == "import_specifier" {
-                                        let name = imp.child_by_field_name("name")
+                                        let name = imp
+                                            .child_by_field_name("name")
                                             .map(|x| node_text(x, src.as_bytes()).to_string())
-                                            .or_else(|| imp.child_by_field_name("alias").map(|x| node_text(x, src.as_bytes()).to_string()))
+                                            .or_else(|| {
+                                                imp.child_by_field_name("alias").map(|x| {
+                                                    node_text(x, src.as_bytes()).to_string()
+                                                })
+                                            })
                                             .unwrap_or_default();
                                         if !name.is_empty() {
-                                            let id = *next_id; *next_id += 1;
+                                            let id = *next_id;
+                                            *next_id += 1;
                                             scopes.declare(&name, Binding::Global(id));
-                                            symbols.push(symbol(id, &name, SymbolKind::Import, path, imp));
-                                            imports.push(ImportDecl { symbol_id: id, local_name: name.clone(), source: source.clone(), is_default: false });
+                                            symbols.push(symbol(
+                                                id,
+                                                &name,
+                                                SymbolKind::Import,
+                                                path,
+                                                imp,
+                                            ));
+                                            imports.push(ImportDecl {
+                                                symbol_id: id,
+                                                local_name: name.clone(),
+                                                source: source.clone(),
+                                                is_default: false,
+                                            });
                                         }
                                     }
                                 }
@@ -282,14 +354,26 @@ fn collect_globals(
     }
 }
 
-fn collect_refs(root: Node, src: &str, module_id: SymbolId, scopes: &mut Scopes, refs: &mut Vec<UnresolvedRef>) {
+fn collect_refs(
+    root: Node,
+    src: &str,
+    module_id: SymbolId,
+    scopes: &mut Scopes,
+    refs: &mut Vec<UnresolvedRef>,
+) {
     let mut cursor = root.walk();
     for child in root.named_children(&mut cursor) {
         walk_node(child, src, module_id, scopes, refs);
     }
 }
 
-fn walk_node(node: Node, src: &str, enclosing: SymbolId, scopes: &mut Scopes, refs: &mut Vec<UnresolvedRef>) {
+fn walk_node(
+    node: Node,
+    src: &str,
+    enclosing: SymbolId,
+    scopes: &mut Scopes,
+    refs: &mut Vec<UnresolvedRef>,
+) {
     match node.kind() {
         "import_statement" => {}
         "class_declaration" => {
@@ -297,7 +381,9 @@ fn walk_node(node: Node, src: &str, enclosing: SymbolId, scopes: &mut Scopes, re
                 let name = node_text(name_node, src.as_bytes()).to_string();
                 let def_id = resolve_def_id(node, src, scopes, enclosing);
                 scopes.push();
-                if !name.is_empty() { scopes.declare(&name, Binding::Local); }
+                if !name.is_empty() {
+                    scopes.declare(&name, Binding::Local);
+                }
                 scopes.declare("this", Binding::Local);
                 if let Some(body) = node.child_by_field_name("body") {
                     let mut c = body.walk();
@@ -341,11 +427,19 @@ fn walk_node(node: Node, src: &str, enclosing: SymbolId, scopes: &mut Scopes, re
             let name = node_text(node, src.as_bytes()).to_string();
             match scopes.resolve(&name) {
                 Some(Binding::Global(id)) if id != enclosing => {
-                    refs.push(UnresolvedRef { from: enclosing, target: RefTarget::Symbol(id), kind: RefKind::Static });
+                    refs.push(UnresolvedRef {
+                        from: enclosing,
+                        target: RefTarget::Symbol(id),
+                        kind: RefKind::Static,
+                    });
                 }
                 Some(Binding::Local) => {}
                 _ => {
-                    refs.push(UnresolvedRef { from: enclosing, target: RefTarget::Name(name), kind: RefKind::Dynamic });
+                    refs.push(UnresolvedRef {
+                        from: enclosing,
+                        target: RefTarget::Name(name),
+                        kind: RefKind::Dynamic,
+                    });
                 }
             }
         }
@@ -361,13 +455,18 @@ fn walk_node(node: Node, src: &str, enclosing: SymbolId, scopes: &mut Scopes, re
 fn resolve_def_id(node: Node, src: &str, scopes: &Scopes, enclosing: SymbolId) -> SymbolId {
     node.child_by_field_name("name")
         .and_then(|n| scopes.resolve(node_text(n, src.as_bytes())))
-        .and_then(|b| match b { Binding::Global(id) => Some(id), _ => None })
+        .and_then(|b| match b {
+            Binding::Global(id) => Some(id),
+            _ => None,
+        })
         .unwrap_or(enclosing)
 }
 
 fn bind_locals(node: Node, src: &[u8], scopes: &mut Scopes) {
     match node.kind() {
-        "identifier" => { scopes.declare(node_text(node, src), Binding::Local); }
+        "identifier" => {
+            scopes.declare(node_text(node, src), Binding::Local);
+        }
         "object_pattern" | "array_pattern" => {
             let mut c = node.walk();
             for child in node.named_children(&mut c) {
@@ -378,7 +477,13 @@ fn bind_locals(node: Node, src: &[u8], scopes: &mut Scopes) {
     }
 }
 
-fn handle_call(node: Node, src: &str, enclosing: SymbolId, scopes: &mut Scopes, refs: &mut Vec<UnresolvedRef>) {
+fn handle_call(
+    node: Node,
+    src: &str,
+    enclosing: SymbolId,
+    scopes: &mut Scopes,
+    refs: &mut Vec<UnresolvedRef>,
+) {
     if let Some(func) = node.child_by_field_name("function") {
         let fname = node_text(func, src.as_bytes());
         if fname == "require" || fname == "eval" {
@@ -390,12 +495,20 @@ fn handle_call(node: Node, src: &str, enclosing: SymbolId, scopes: &mut Scopes, 
                     let v = node_text(first_node, src.as_bytes());
                     let s = v.trim_matches(['\'', '"', '`']);
                     if !s.is_empty() {
-                        refs.push(UnresolvedRef { from: enclosing, target: RefTarget::Name(s.to_string()), kind });
+                        refs.push(UnresolvedRef {
+                            from: enclosing,
+                            target: RefTarget::Name(s.to_string()),
+                            kind,
+                        });
                     }
                 }
             }
             if fname == "eval" {
-                refs.push(UnresolvedRef { from: enclosing, target: RefTarget::Name("eval".into()), kind: RefKind::Dynamic });
+                refs.push(UnresolvedRef {
+                    from: enclosing,
+                    target: RefTarget::Name("eval".into()),
+                    kind: RefKind::Dynamic,
+                });
             }
         }
     }

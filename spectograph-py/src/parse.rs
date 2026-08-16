@@ -130,12 +130,7 @@ fn symbol(id: SymbolId, name: &str, kind: SymbolKind, path: &Path, node: Node) -
 }
 
 /// Parse a single Python file. `module_id` is assigned by the caller.
-pub fn parse_file(
-    path: &Path,
-    src: &str,
-    module_id: SymbolId,
-    next_id: &mut usize,
-) -> FileResult {
+pub fn parse_file(path: &Path, src: &str, module_id: SymbolId, next_id: &mut usize) -> FileResult {
     let mut parser = Parser::new();
     let lang: tree_sitter::Language = tree_sitter_python::LANGUAGE.into();
     parser.set_language(&lang).expect("python grammar");
@@ -162,7 +157,19 @@ pub fn parse_file(
     );
     symbols.push(module);
 
-    collect_globals(root, path, src, module_id, next_id, &mut symbols, &mut scopes, &mut exports, &mut class_methods, &mut imports, &mut class_bases);
+    collect_globals(
+        root,
+        path,
+        src,
+        module_id,
+        next_id,
+        &mut symbols,
+        &mut scopes,
+        &mut exports,
+        &mut class_methods,
+        &mut imports,
+        &mut class_bases,
+    );
 
     // Resolve base-class names to ids once all class symbols are known.
     let mut resolved_bases: HashMap<SymbolId, Vec<SymbolId>> = HashMap::new();
@@ -181,9 +188,23 @@ pub fn parse_file(
         }
     }
 
-    collect_refs(root, src, module_id, &mut scopes, &mut refs, &class_methods, &resolved_bases);
+    collect_refs(
+        root,
+        src,
+        module_id,
+        &mut scopes,
+        &mut refs,
+        &class_methods,
+        &resolved_bases,
+    );
 
-    FileResult { module_id, symbols, refs, exports, imports }
+    FileResult {
+        module_id,
+        symbols,
+        refs,
+        exports,
+        imports,
+    }
 }
 
 /// Extract the imported name and its alias from an import clause node.
@@ -261,13 +282,7 @@ fn collect_globals(
                         let id = *next_id;
                         *next_id += 1;
                         scopes.declare(&sym_name, Binding::Global(id));
-                        symbols.push(symbol(
-                            id,
-                            &sym_name,
-                            SymbolKind::Function,
-                            path,
-                            fn_node,
-                        ));
+                        symbols.push(symbol(id, &sym_name, SymbolKind::Function, path, fn_node));
                     }
                 }
             }
@@ -316,7 +331,8 @@ fn collect_globals(
                             if let Some(mfn) = mfn {
                                 if mfn.kind() == "function_definition" {
                                     if let Some(mname_node) = mfn.child_by_field_name("name") {
-                                        let mname = node_text(mname_node, src.as_bytes()).to_string();
+                                        let mname =
+                                            node_text(mname_node, src.as_bytes()).to_string();
                                         let mid = *next_id;
                                         *next_id += 1;
                                         scopes.declare(&mname, Binding::Global(mid));
@@ -411,7 +427,10 @@ fn collect_globals(
                                         let v = node_text(s, src.as_bytes());
                                         let name = v.trim_matches(['\'', '"']).to_string();
                                         if !name.is_empty() {
-                                            exports.push(ExportDecl { name, span: span(s) });
+                                            exports.push(ExportDecl {
+                                                name,
+                                                span: span(s),
+                                            });
                                         }
                                     }
                                 }
@@ -431,9 +450,15 @@ fn bind_local_identifiers(node: Node, src: &[u8], scopes: &mut Scopes) {
         "identifier" => {
             scopes.declare(node_text(node, src), Binding::Local);
         }
-        "pattern_list" | "tuple_pattern" | "list_pattern" | "list_splat_pattern"
-        | "dictionary_splat_pattern" | "typed_parameter" | "default_parameter"
-        | "typed_default_parameter" | "keyword_argument" => {
+        "pattern_list"
+        | "tuple_pattern"
+        | "list_pattern"
+        | "list_splat_pattern"
+        | "dictionary_splat_pattern"
+        | "typed_parameter"
+        | "default_parameter"
+        | "typed_default_parameter"
+        | "keyword_argument" => {
             let mut cursor = node.walk();
             for child in node.named_children(&mut cursor) {
                 bind_local_identifiers(child, src, scopes);
@@ -455,7 +480,16 @@ fn collect_refs(
 ) {
     let mut cursor = root.walk();
     for child in root.named_children(&mut cursor) {
-        walk_node(child, src, module_id, scopes, refs, None, class_methods, class_bases);
+        walk_node(
+            child,
+            src,
+            module_id,
+            scopes,
+            refs,
+            None,
+            class_methods,
+            class_bases,
+        );
     }
 }
 
@@ -505,7 +539,16 @@ fn walk_node(
             if let Some(body) = node.child_by_field_name("body") {
                 let mut cursor = body.walk();
                 for child in body.named_children(&mut cursor) {
-                    walk_node(child, src, def_id, scopes, refs, Some(def_id), class_methods, class_bases);
+                    walk_node(
+                        child,
+                        src,
+                        def_id,
+                        scopes,
+                        refs,
+                        Some(def_id),
+                        class_methods,
+                        class_bases,
+                    );
                 }
             }
             scopes.pop();
@@ -524,7 +567,16 @@ fn walk_node(
             if let Some(body) = node.child_by_field_name("body") {
                 let mut cursor = body.walk();
                 for child in body.named_children(&mut cursor) {
-                    walk_node(child, src, def_id, scopes, refs, current_class, class_methods, class_bases);
+                    walk_node(
+                        child,
+                        src,
+                        def_id,
+                        scopes,
+                        refs,
+                        current_class,
+                        class_methods,
+                        class_bases,
+                    );
                 }
             }
             scopes.pop();
@@ -536,21 +588,56 @@ fn walk_node(
             }
             let mut cursor = node.walk();
             for child in node.named_children(&mut cursor) {
-                walk_node(child, src, enclosing, scopes, refs, current_class, class_methods, class_bases);
+                walk_node(
+                    child,
+                    src,
+                    enclosing,
+                    scopes,
+                    refs,
+                    current_class,
+                    class_methods,
+                    class_bases,
+                );
             }
         }
         // Attribute access: `self.method` resolves to the enclosing class's method,
         // and `super().method` resolves to a parent class's method.
         "attribute" => {
-            resolve_self_attribute(node, src, enclosing, current_class, class_methods, class_bases, refs);
+            resolve_self_attribute(
+                node,
+                src,
+                enclosing,
+                current_class,
+                class_methods,
+                class_bases,
+                refs,
+            );
             let mut cursor = node.walk();
             for child in node.named_children(&mut cursor) {
-                walk_node(child, src, enclosing, scopes, refs, current_class, class_methods, class_bases);
+                walk_node(
+                    child,
+                    src,
+                    enclosing,
+                    scopes,
+                    refs,
+                    current_class,
+                    class_methods,
+                    class_bases,
+                );
             }
         }
         // Uncertain runtime constructs.
         "call" => {
-            handle_call(node, src, enclosing, scopes, refs, current_class, class_methods, class_bases);
+            handle_call(
+                node,
+                src,
+                enclosing,
+                scopes,
+                refs,
+                current_class,
+                class_methods,
+                class_bases,
+            );
         }
         "identifier" => {
             let name = node_text(node, src.as_bytes()).to_string();
@@ -571,7 +658,16 @@ fn walk_node(
         _ => {
             let mut cursor = node.walk();
             for child in node.named_children(&mut cursor) {
-                walk_node(child, src, enclosing, scopes, refs, current_class, class_methods, class_bases);
+                walk_node(
+                    child,
+                    src,
+                    enclosing,
+                    scopes,
+                    refs,
+                    current_class,
+                    class_methods,
+                    class_bases,
+                );
             }
         }
     }
@@ -601,7 +697,9 @@ fn resolve_self_attribute(
     class_bases: &HashMap<SymbolId, Vec<SymbolId>>,
     refs: &mut Vec<UnresolvedRef>,
 ) {
-    let Some(current_class) = current_class else { return };
+    let Some(current_class) = current_class else {
+        return;
+    };
     let obj = node.child_by_field_name("object");
     let attr = node.child_by_field_name("attribute");
     let attr_name = attr.map(|a| node_text(a, src.as_bytes())).unwrap_or("");
@@ -699,6 +797,15 @@ fn handle_call(
     // Recurse into the call normally for other references.
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
-        walk_node(child, src, enclosing, scopes, refs, current_class, class_methods, class_bases);
+        walk_node(
+            child,
+            src,
+            enclosing,
+            scopes,
+            refs,
+            current_class,
+            class_methods,
+            class_bases,
+        );
     }
 }

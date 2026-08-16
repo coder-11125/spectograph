@@ -70,7 +70,12 @@ pub struct SourceSpan {
 
 impl SourceSpan {
     pub fn new(start_line: usize, start_col: usize, end_line: usize, end_col: usize) -> Self {
-        Self { start_line, start_col, end_line, end_col }
+        Self {
+            start_line,
+            start_col,
+            end_line,
+            end_col,
+        }
     }
 }
 
