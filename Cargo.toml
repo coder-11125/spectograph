@@ -5,6 +5,7 @@ members = [
     "spectograph-analyzer",
     "spectograph-cli",
     "spectograph-py",
+    "spectograph-js",
 ]
 
 [workspace.package]
@@ -19,6 +20,7 @@ authors = ["spectograph contributors"]
 spectograph-core = { path = "spectograph-core", version = "0.1.0" }
 spectograph-analyzer = { path = "spectograph-analyzer", version = "0.1.0" }
 spectograph-py = { path = "spectograph-py", version = "0.1.0" }
+spectograph-js = { path = "spectograph-js", version = "0.1.0" }
 
 # IR / graph
 serde = { version = "1", features = ["derive"] }
