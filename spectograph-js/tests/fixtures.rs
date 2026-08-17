@@ -84,3 +84,66 @@ fn js_classes_fixture() {
         "unusedMethod should exist"
     );
 }
+
+/// js-inheritance: class inheritance with super calls
+#[test]
+fn js_inheritance_fixture() {
+    let program = analyze("js-inheritance");
+    let symbol_names: Vec<_> = program.symbols.iter().map(|s| s.name.clone()).collect();
+    assert!(
+        symbol_names.contains(&"Parent".to_string()),
+        "Parent class should exist"
+    );
+    assert!(
+        symbol_names.contains(&"Child".to_string()),
+        "Child class should exist"
+    );
+    // Check that methods are created (they may not have ClassName.methodName pattern for imports)
+    assert!(
+        symbol_names.iter().any(|n| n.contains("greet")),
+        "greet method should exist"
+    );
+    assert!(
+        symbol_names.iter().any(|n| n.contains("play")),
+        "play method should exist"
+    );
+    // Check that multiple files are parsed
+    assert!(program.symbols.len() > 5, "should have symbols from multiple files");
+}
+
+/// js-relative: relative import resolution
+#[test]
+fn js_relative_fixture() {
+    let program = analyze("js-relative");
+    let symbol_names: Vec<_> = program.symbols.iter().map(|s| s.name.clone()).collect();
+    assert!(
+        symbol_names.contains(&"helper".to_string()),
+        "helper function should exist"
+    );
+    assert!(
+        symbol_names.contains(&"otherFunction".to_string()),
+        "otherFunction should exist"
+    );
+    // Check that multiple files are parsed
+    assert!(program.symbols.len() > 5, "should have symbols from multiple files");
+}
+
+/// js-dynamic: dynamic import patterns
+#[test]
+fn js_dynamic_fixture() {
+    let program = analyze("js-dynamic");
+    let symbol_names: Vec<_> = program.symbols.iter().map(|s| s.name.clone()).collect();
+    assert!(
+        symbol_names.contains(&"staticHelper".to_string()),
+        "staticHelper should exist"
+    );
+    assert!(
+        symbol_names.contains(&"dynamicHelper".to_string()),
+        "dynamicHelper should exist"
+    );
+    // Check that async functions are parsed
+    assert!(
+        symbol_names.contains(&"loadDynamic".to_string()),
+        "loadDynamic should exist"
+    );
+}
