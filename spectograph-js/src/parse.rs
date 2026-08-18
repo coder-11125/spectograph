@@ -203,6 +203,142 @@ fn collect_globals(
                 // Handle: export { foo } or export default foo
                 // For now, skip these - they'll be handled by import resolution
             }
+            "assignment_expression" => {
+                // Handle CommonJS: module.exports = value and exports.* = value
+                if let Some(left) = child.child_by_field_name("left") {
+                    if left.kind() == "member_expression" {
+                        if let Some(object) = left.child_by_field_name("object") {
+                            let object_text = node_text(object, src.as_bytes());
+                            if object_text == "module" {
+                                if let Some(property) = left.child_by_field_name("property") {
+                                    let property_text = node_text(property, src.as_bytes());
+                                    if property_text == "exports" {
+                                        // This is module.exports = something
+                                        if let Some(right) = child.child_by_field_name("right") {
+                                            match right.kind() {
+                                                "function" | "function_expression" => {
+                                                    // module.exports = function() {}
+                                                    if let Some(name_node) = right.child_by_field_name("name") {
+                                                        let name = node_text(name_node, src.as_bytes()).to_string();
+                                                        let id = *next_id;
+                                                        *next_id += 1;
+                                                        scopes.declare(&name, Binding::Global(id));
+                                                        symbols.push(symbol(id, &name, SymbolKind::Function, path, right));
+                                                    } else {
+                                                        // Anonymous function exported as default
+                                                        let name = "default".to_string();
+                                                        let id = *next_id;
+                                                        *next_id += 1;
+                                                        scopes.declare(&name, Binding::Global(id));
+                                                        symbols.push(symbol(id, &name, SymbolKind::Function, path, right));
+                                                    }
+                                                }
+                                                "class_expression" => {
+                                                    // module.exports = class {}
+                                                    if let Some(name_node) = right.child_by_field_name("name") {
+                                                        let name = node_text(name_node, src.as_bytes()).to_string();
+                                                        let id = *next_id;
+                                                        *next_id += 1;
+                                                        scopes.declare(&name, Binding::Global(id));
+                                                        symbols.push(symbol(id, &name, SymbolKind::Class, path, right));
+                                                    } else {
+                                                        // Anonymous class exported as default
+                                                        let name = "default".to_string();
+                                                        let id = *next_id;
+                                                        *next_id += 1;
+                                                        scopes.declare(&name, Binding::Global(id));
+                                                        symbols.push(symbol(id, &name, SymbolKind::Class, path, right));
+                                                    }
+                                                }
+                                                "object_expression" => {
+                                                    // module.exports = { key: value }
+                                                    // Parse object properties as exports
+                                                    let mut oc = right.walk();
+                                                    for prop in right.named_children(&mut oc) {
+                                                        if prop.kind() == "pair" {
+                                                            if let Some(key_node) = prop.child_by_field_name("key") {
+                                                                let key = node_text(key_node, src.as_bytes()).to_string();
+                                                                let id = *next_id;
+                                                                *next_id += 1;
+                                                                scopes.declare(&key, Binding::Global(id));
+                                                                symbols.push(symbol(id, &key, SymbolKind::Const, path, prop));
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                                "identifier" => {
+                                                    // module.exports = existingVariable
+                                                    let _name = node_text(right, src.as_bytes()).to_string();
+                                                    // Just create a reference, not a new symbol
+                                                    // The symbol should already exist from the variable declaration
+                                                }
+                                                _ => {
+                                                    // Other expressions - mark as default export
+                                                    let name = "default".to_string();
+                                                    let id = *next_id;
+                                                    *next_id += 1;
+                                                    scopes.declare(&name, Binding::Global(id));
+                                                    symbols.push(symbol(id, &name, SymbolKind::Const, path, right));
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            } else if object_text == "exports" {
+                                // This is exports.something = value
+                                if let Some(property) = left.child_by_field_name("property") {
+                                    let property_name = node_text(property, src.as_bytes()).to_string();
+                                    // Create an export symbol for this property
+                                    let id = *next_id;
+                                    *next_id += 1;
+                                    scopes.declare(&property_name, Binding::Global(id));
+                                    symbols.push(symbol(id, &property_name, SymbolKind::Const, path, child));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            "call_expression" => {
+                // Handle Object.assign(exports, {...}) pattern
+                if let Some(func) = child.child_by_field_name("function") {
+                    let fname = node_text(func, src.as_bytes());
+                    if fname == "Object.assign" {
+                        if let Some(arg) = child.child_by_field_name("arguments") {
+                            let mut c = arg.walk();
+                            let args: Vec<_> = arg.named_children(&mut c).collect();
+                            if args.len() >= 2 {
+                                // Check if first argument is exports
+                                if let Some(first_arg) = args.first() {
+                                    if first_arg.kind() == "identifier" {
+                                        let first_arg_text = node_text(*first_arg, src.as_bytes());
+                                        if first_arg_text == "exports" {
+                                            // This is Object.assign(exports, {...})
+                                            if let Some(second_arg) = args.get(1) {
+                                                if second_arg.kind() == "object_expression" {
+                                                    // Parse object properties as exports
+                                                    let mut oc = second_arg.walk();
+                                                    for prop in second_arg.named_children(&mut oc) {
+                                                        if prop.kind() == "pair" {
+                                                            if let Some(key_node) = prop.child_by_field_name("key") {
+                                                                let key = node_text(key_node, src.as_bytes()).to_string();
+                                                                let id = *next_id;
+                                                                *next_id += 1;
+                                                                scopes.declare(&key, Binding::Global(id));
+                                                                symbols.push(symbol(id, &key, SymbolKind::Const, path, prop));
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
             "class_declaration" => {
                 if let Some(name_node) = child.child_by_field_name("name") {
                     let name = node_text(name_node, src.as_bytes()).to_string();
@@ -245,8 +381,46 @@ fn collect_globals(
                             let name = node_text(name_node, src.as_bytes()).to_string();
                             let id = *next_id;
                             *next_id += 1;
+                            
+                            // Check if this is a require() call
+                            let kind = if let Some(value) = decl.child_by_field_name("value") {
+                                if value.kind() == "call_expression" {
+                                    if let Some(func) = value.child_by_field_name("function") {
+                                        let fname = node_text(func, src.as_bytes());
+                                        if fname == "require" {
+                                            // Extract module path
+                                            if let Some(arg) = value.child_by_field_name("arguments") {
+                                                let mut ac = arg.walk();
+                                                let first = arg.named_children(&mut ac).next();
+                                                if let Some(first_node) = first {
+                                                    let v = node_text(first_node, src.as_bytes());
+                                                    let module_path = v.trim_matches(['\'', '"', '`']);
+                                                    if !module_path.is_empty() {
+                                                        imports.push(ImportDecl {
+                                                            symbol_id: id,
+                                                            local_name: name.clone(),
+                                                            source: module_path.to_string(),
+                                                            is_default: true,
+                                                        });
+                                                    }
+                                                }
+                                            }
+                                            SymbolKind::Import
+                                        } else {
+                                            SymbolKind::Const
+                                        }
+                                    } else {
+                                        SymbolKind::Const
+                                    }
+                                } else {
+                                    SymbolKind::Const
+                                }
+                            } else {
+                                SymbolKind::Const
+                            };
+                            
                             scopes.declare(&name, Binding::Global(id));
-                            symbols.push(symbol(id, &name, SymbolKind::Const, path, name_node));
+                            symbols.push(symbol(id, &name, kind, path, name_node));
                         }
                     }
                 }

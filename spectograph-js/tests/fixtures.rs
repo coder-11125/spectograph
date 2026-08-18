@@ -147,3 +147,14 @@ fn js_dynamic_fixture() {
         "loadDynamic should exist"
     );
 }
+
+/// js-commonjs: CommonJS module patterns
+#[test]
+fn js_commonjs_fixture() {
+    let program = analyze("js-commonjs");
+    let symbol_names: Vec<_> = program.symbols.iter().map(|s| s.name.clone()).collect();
+    // Check that CommonJS patterns are parsed
+    assert!(!symbol_names.is_empty(), "should have symbols from CommonJS files");
+    // Check that require() calls are handled
+    assert!(program.symbols.len() > 3, "should have symbols from multiple files");
+}

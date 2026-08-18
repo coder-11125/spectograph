@@ -136,8 +136,8 @@ impl Analyzer for JavaScriptAnalyzer {
                             kind: RefKind::ReExport,
                         });
                     } else if imp.is_default {
-                        // Try to find default export in the target module
-                        // Look for a symbol with the same name as the import
+                        // For CommonJS default imports, fall back to global def_index
+                        // This handles cases where module.exports = function() {} patterns
                         if let Some(&def_id) = def_index.get(&imp.local_name) {
                             program.references.push(Reference {
                                 from: imp.symbol_id,
@@ -146,6 +146,10 @@ impl Analyzer for JavaScriptAnalyzer {
                             });
                         }
                     }
+                } else {
+                    // For CommonJS modules that might not be in module_paths,
+                    // try to resolve using node_modules or external packages
+                    // For now, just skip external packages
                 }
             }
         }
