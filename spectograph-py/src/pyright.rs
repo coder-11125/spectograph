@@ -317,10 +317,11 @@ impl SymbolSpanIndex {
         let mut file_spans: HashMap<PathBuf, Vec<(usize, usize, usize)>> = HashMap::new();
 
         for span in spans {
-            file_spans
-                .entry(span.file.clone())
-                .or_default()
-                .push((span.start_line, span.end_line, span.id));
+            file_spans.entry(span.file.clone()).or_default().push((
+                span.start_line,
+                span.end_line,
+                span.id,
+            ));
         }
 
         // Sort spans by start_line for binary search
@@ -450,9 +451,7 @@ impl PipelineStats {
 
     fn finalize(&mut self) {
         if let (Some(started_at), Some(completed_at)) = (self.started_at, self.completed_at) {
-            let total_ms = completed_at
-                .duration_since(started_at)
-                .as_millis() as u64;
+            let total_ms = completed_at.duration_since(started_at).as_millis() as u64;
             self.total_time_ms = total_ms;
             if self.total_queries > 0 {
                 self.avg_query_time_ms = total_ms as f64 / self.total_queries as f64;
