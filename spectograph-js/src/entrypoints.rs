@@ -118,6 +118,17 @@ pub fn detect_from_package_json(root: &Path) -> Result<Vec<Entrypoint>, Entrypoi
         }
     }
 
+    // package.json "browser" field, string form: bundlers use this as the browser-build
+    // entry in place of "main". The object form (per-module remapping) is handled during
+    // import resolution instead (see `resolve_module_path` in lib.rs).
+    if let Some(browser) = value.get("browser") {
+        if let Some(browser_str) = browser.as_str() {
+            out.push(Entrypoint {
+                path: root.join(browser_str).to_string_lossy().into_owned(),
+            });
+        }
+    }
+
     // package.json "exports" field (ES Modules entrypoints)
     if let Some(exports) = value.get("exports") {
         match exports {

@@ -108,6 +108,25 @@ pub struct Symbol {
     pub span: SourceSpan,
     /// True if this symbol is reachable from an explicit entrypoint.
     pub reachable: bool,
+    /// The runtime this symbol is scoped to, when an analyzer can tell.
+    pub environment: Environment,
+}
+
+/// The runtime a [`Symbol`] or [`Reference`] is scoped to.
+///
+/// Inferred from environment guards (`typeof window !== 'undefined'`,
+/// `typeof process !== 'undefined'`), direct use of environment-only globals, or
+/// bundler remapping (package.json `browser` field). Analyzers with no notion of
+/// this distinction (e.g. Python) leave every symbol/reference at the default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+pub enum Environment {
+    /// No environment-specific signal found; assumed to run anywhere.
+    #[default]
+    Universal,
+    /// Guarded by, or dependent on, Node.js-only globals (`process`, `global`, `__dirname`, ...).
+    Node,
+    /// Guarded by, or dependent on, browser-only globals (`window`, `document`, ...).
+    Browser,
 }
 
 /// How confident we are that a [`Reference`] really points where we think.
@@ -138,6 +157,8 @@ pub struct Reference {
     pub from: SymbolId,
     pub to: SymbolId,
     pub kind: RefKind,
+    /// The runtime this reference is scoped to, when an analyzer can tell.
+    pub environment: Environment,
 }
 
 /// A full analysis result for one language.

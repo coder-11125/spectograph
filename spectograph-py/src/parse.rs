@@ -12,7 +12,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use spectograph_core::ir::{RefKind, SourceSpan, Symbol, SymbolId, SymbolKind};
+use spectograph_core::ir::{Environment, RefKind, SourceSpan, Symbol, SymbolId, SymbolKind};
 use tree_sitter::{Node, Parser};
 
 /// How a name resolves.
@@ -126,6 +126,7 @@ fn symbol(id: SymbolId, name: &str, kind: SymbolKind, path: &Path, node: Node) -
         file: path.to_path_buf(),
         span: span(node),
         reachable: false,
+        environment: Environment::Universal,
     }
 }
 

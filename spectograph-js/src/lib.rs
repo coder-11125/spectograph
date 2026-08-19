@@ -12,27 +12,72 @@ use entrypoints::detect_entrypoint_symbols;
 use parse::parse_file;
 use serde_json::Value;
 use spectograph_analyzer::{discover, AnalyzeError, Analyzer};
-use spectograph_core::ir::{Language, Program, RefKind, Reference, SymbolId, SymbolKind};
+use spectograph_core::ir::{
+    Environment, Language, Program, RefKind, Reference, SymbolId, SymbolKind,
+};
 
 /// Analyzer for the JavaScript language.
 pub struct JavaScriptAnalyzer;
 
-/// Node.js-style module resolution helper
-fn resolve_module_path(base: &Path, module_path: &str, _root: &Path) -> PathBuf {
+/// Read the `browser` field of the project's root `package.json`, if it's an object map
+/// (bundlers use this to substitute browser-specific modules for Node ones, e.g.
+/// `{"fs": false, "./server.js": "./client.js"}`). A string-form `browser` field is
+/// handled separately as an entrypoint (see [`entrypoints::detect_from_package_json`]).
+fn read_browser_map(root: &Path) -> HashMap<String, Value> {
+    std::fs::read_to_string(root.join("package.json"))
+        .ok()
+        .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+        .and_then(|v| v.get("browser").cloned())
+        .and_then(|b| b.as_object().cloned())
+        .map(|m| m.into_iter().collect())
+        .unwrap_or_default()
+}
+
+/// Collapse `.`/`..` components so a joined path's string form matches the plain
+/// paths [`spectograph_analyzer::discover::discover_files`] produces. `PathBuf::join`
+/// preserves a leading `./` verbatim (e.g. `base/./client.js`), which otherwise never
+/// string-equals the canonical `base/client.js` key used for module lookups.
+fn normalize_path(path: &Path) -> PathBuf {
+    let mut result = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir if result.file_name().is_some() => {
+                result.pop();
+            }
+            other => result.push(other),
+        }
+    }
+    result
+}
+
+/// Node.js-style module resolution helper, with optional bundler `browser`-field
+/// remapping. Returns the resolved file path plus the [`Environment`] the resolution
+/// implies (`Browser` only when a `browser` field remap was applied).
+fn resolve_module_path(
+    base: &Path,
+    module_path: &str,
+    browser_map: &HashMap<String, Value>,
+) -> (PathBuf, Environment) {
+    if let Some(mapped) = browser_map.get(module_path).and_then(|v| v.as_str()) {
+        let (resolved, _) = resolve_module_path(base, mapped, &HashMap::new());
+        return (resolved, Environment::Browser);
+    }
+
     // Handle absolute paths
     if module_path.starts_with('/') || module_path.starts_with("\\") {
-        return PathBuf::from(module_path);
+        return (PathBuf::from(module_path), Environment::Universal);
     }
 
     // Handle relative paths (starting with '.' or '..')
     if module_path.starts_with('.') {
-        let path = base.join(module_path);
+        let path = normalize_path(&base.join(module_path));
 
         // If the path doesn't have an extension, try .js
         if path.extension().is_none() {
             let with_js = path.with_extension("js");
             if with_js.exists() {
-                return with_js;
+                return (with_js, Environment::Universal);
             }
         }
 
@@ -40,11 +85,11 @@ fn resolve_module_path(base: &Path, module_path: &str, _root: &Path) -> PathBuf 
         if path.is_dir() {
             let index_path = path.join("index.js");
             if index_path.exists() {
-                return index_path;
+                return (index_path, Environment::Universal);
             }
         }
 
-        return path;
+        return (path, Environment::Universal);
     }
 
     // Handle node_modules packages (non-relative imports)
@@ -62,9 +107,9 @@ fn resolve_module_path(base: &Path, module_path: &str, _root: &Path) -> PathBuf 
                     if let Ok(content) = std::fs::read_to_string(&package_json) {
                         if let Ok(json) = serde_json::from_str::<Value>(&content) {
                             if let Some(main) = json.get("main").and_then(|m| m.as_str()) {
-                                let main_path = node_modules.join(main);
+                                let main_path = normalize_path(&node_modules.join(main));
                                 if main_path.exists() {
-                                    return main_path;
+                                    return (main_path, Environment::Universal);
                                 }
                             }
                         }
@@ -72,12 +117,12 @@ fn resolve_module_path(base: &Path, module_path: &str, _root: &Path) -> PathBuf 
                     // Fall back to index.js
                     let index_path = node_modules.join("index.js");
                     if index_path.exists() {
-                        return index_path;
+                        return (index_path, Environment::Universal);
                     }
                 }
             } else {
                 // It's a file, return it
-                return node_modules;
+                return (node_modules, Environment::Universal);
             }
         }
 
@@ -90,7 +135,7 @@ fn resolve_module_path(base: &Path, module_path: &str, _root: &Path) -> PathBuf 
     }
 
     // Fallback: just return the path as-is (will fail later)
-    base.join(module_path)
+    (base.join(module_path), Environment::Universal)
 }
 
 impl Analyzer for JavaScriptAnalyzer {
@@ -120,6 +165,8 @@ impl Analyzer for JavaScriptAnalyzer {
         let mut def_index: HashMap<String, SymbolId> = HashMap::new();
         // Track each file's module id
         let mut file_module: HashMap<String, SymbolId> = HashMap::new();
+        // Bundler `browser` field remapping, applied during module resolution below.
+        let browser_map = read_browser_map(root);
 
         // Pass 1: parse each file, collect its symbols and unresolved refs.
         let mut parsed: Vec<(String, parse::FileResult)> = Vec::new();
@@ -180,6 +227,7 @@ impl Analyzer for JavaScriptAnalyzer {
                         from: r.from,
                         to,
                         kind: r.kind,
+                        environment: r.environment,
                     });
                 }
             }
@@ -191,13 +239,20 @@ impl Analyzer for JavaScriptAnalyzer {
         for (_path, result) in &parsed {
             for imp in &result.imports {
                 // Resolve the source module with Node.js-style resolution
-                let source_path = result
+                let (source_path, resolved_env) = result
                     .symbols
                     .iter()
                     .find(|s| s.kind == SymbolKind::Module)
                     .map(|s| s.file.parent().unwrap_or(&s.file))
-                    .map(|p| resolve_module_path(p, &imp.source, root))
-                    .unwrap_or_else(|| root.join(&imp.source));
+                    .map(|p| resolve_module_path(p, &imp.source, &browser_map))
+                    .unwrap_or_else(|| (root.join(&imp.source), Environment::Universal));
+                // An explicit guard (Tier 1) is a stronger signal than the browser-field
+                // remap (which only tells us "this specifier differs in a browser build").
+                let ref_env = if imp.environment != Environment::Universal {
+                    imp.environment
+                } else {
+                    resolved_env
+                };
 
                 let source_path_str = source_path.to_string_lossy().into_owned();
 
@@ -211,6 +266,7 @@ impl Analyzer for JavaScriptAnalyzer {
                             from: imp.symbol_id,
                             to: def_id,
                             kind: RefKind::ReExport,
+                            environment: ref_env,
                         });
                     } else if imp.is_default {
                         // For CommonJS default imports, fall back to global def_index
@@ -220,6 +276,7 @@ impl Analyzer for JavaScriptAnalyzer {
                                 from: imp.symbol_id,
                                 to: def_id,
                                 kind: RefKind::ReExport,
+                                environment: ref_env,
                             });
                         }
                     }

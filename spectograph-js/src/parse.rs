@@ -3,8 +3,80 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use spectograph_core::ir::{RefKind, SourceSpan, Symbol, SymbolId, SymbolKind};
+use spectograph_core::ir::{Environment, RefKind, SourceSpan, Symbol, SymbolId, SymbolKind};
 use tree_sitter::{Node, Parser};
+
+/// Environment-indicative globals: identifiers whose mere presence in `typeof X`
+/// (a guard) or as a bare reference signals that surrounding code targets one
+/// runtime specifically.
+fn env_of_global(name: &str) -> Option<Environment> {
+    match name {
+        "window" | "document" | "navigator" | "localStorage" | "sessionStorage" => {
+            Some(Environment::Browser)
+        }
+        "process" | "global" | "__dirname" | "__filename" | "Buffer" => Some(Environment::Node),
+        _ => None,
+    }
+}
+
+fn opposite_env(env: Environment) -> Environment {
+    match env {
+        Environment::Browser => Environment::Node,
+        Environment::Node => Environment::Browser,
+        Environment::Universal => Environment::Universal,
+    }
+}
+
+/// If `node` is `typeof <identifier>`, return the identifier's name.
+fn typeof_target<'a>(node: Node, src: &'a [u8]) -> Option<&'a str> {
+    if node.kind() != "unary_expression" {
+        return None;
+    }
+    let op = node.child_by_field_name("operator")?;
+    if node_text(op, src) != "typeof" {
+        return None;
+    }
+    let arg = node.child_by_field_name("argument")?;
+    if arg.kind() == "identifier" {
+        Some(node_text(arg, src))
+    } else {
+        None
+    }
+}
+
+/// Detect an environment guard: `typeof X !== 'undefined'` / `=== 'undefined'`,
+/// operands in either order, where X is an environment-indicative global.
+/// Returns `(consequence_env, alternative_env)`.
+fn detect_env_guard(condition: Node, src: &[u8]) -> Option<(Environment, Environment)> {
+    let expr = if condition.kind() == "parenthesized_expression" {
+        condition.named_child(0)?
+    } else {
+        condition
+    };
+    if expr.kind() != "binary_expression" {
+        return None;
+    }
+    let operator = node_text(expr.child_by_field_name("operator")?, src);
+    let left = expr.child_by_field_name("left")?;
+    let right = expr.child_by_field_name("right")?;
+
+    let (name, literal_side) = if let Some(name) = typeof_target(left, src) {
+        (name, right)
+    } else {
+        (typeof_target(right, src)?, left)
+    };
+    let literal = node_text(literal_side, src).trim_matches(['\'', '"', '`']);
+    if literal != "undefined" {
+        return None;
+    }
+    let env = env_of_global(name)?;
+    let opposite = opposite_env(env);
+    match operator {
+        "!==" | "!=" => Some((env, opposite)),
+        "===" | "==" => Some((opposite, env)),
+        _ => None,
+    }
+}
 
 #[derive(Clone, Copy, PartialEq)]
 #[allow(dead_code)]
@@ -58,6 +130,8 @@ pub struct ImportDecl {
     pub local_name: String,
     pub source: String,
     pub is_default: bool,
+    /// Runtime this import is scoped to, if declared inside an environment guard.
+    pub environment: Environment,
 }
 
 pub enum RefTarget {
@@ -69,6 +143,7 @@ pub struct UnresolvedRef {
     pub from: SymbolId,
     pub target: RefTarget,
     pub kind: RefKind,
+    pub environment: Environment,
 }
 
 fn node_text<'a>(node: Node, src: &'a [u8]) -> &'a str {
@@ -82,7 +157,14 @@ fn span(node: Node) -> SourceSpan {
     SourceSpan::new(s.row + 1, s.column + 1, e.row + 1, e.column + 1)
 }
 
-fn symbol(id: SymbolId, name: &str, kind: SymbolKind, path: &Path, node: Node) -> Symbol {
+fn symbol(
+    id: SymbolId,
+    name: &str,
+    kind: SymbolKind,
+    path: &Path,
+    node: Node,
+    environment: Environment,
+) -> Symbol {
     Symbol {
         id,
         name: name.to_string(),
@@ -90,6 +172,7 @@ fn symbol(id: SymbolId, name: &str, kind: SymbolKind, path: &Path, node: Node) -
         file: path.to_path_buf(),
         span: span(node),
         reachable: false,
+        environment,
     }
 }
 
@@ -113,6 +196,7 @@ pub fn parse_file(path: &Path, src: &str, module_id: SymbolId, next_id: &mut usi
         SymbolKind::Module,
         path,
         root,
+        Environment::Universal,
     ));
 
     collect_globals(
@@ -123,8 +207,21 @@ pub fn parse_file(path: &Path, src: &str, module_id: SymbolId, next_id: &mut usi
         &mut symbols,
         &mut scopes,
         &mut imports,
+        Environment::Universal,
     );
-    collect_refs(root, src, module_id, &mut scopes, &mut refs);
+    let mut env_hints: HashMap<SymbolId, Environment> = HashMap::new();
+    collect_refs(root, src, module_id, &mut scopes, &mut refs, &mut env_hints);
+
+    // Symbols that bare-reference an environment-only global (outside any explicit
+    // guard) inherit that signal too, so e.g. a function touching `window.foo`
+    // is tagged Browser even without a `typeof window` check around it.
+    for sym in symbols.iter_mut() {
+        if sym.environment == Environment::Universal {
+            if let Some(&hint) = env_hints.get(&sym.id) {
+                sym.environment = hint;
+            }
+        }
+    }
 
     FileResult {
         module_id,
@@ -134,6 +231,7 @@ pub fn parse_file(path: &Path, src: &str, module_id: SymbolId, next_id: &mut usi
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn collect_globals(
     root: Node,
     path: &Path,
@@ -142,17 +240,21 @@ fn collect_globals(
     symbols: &mut Vec<Symbol>,
     scopes: &mut Scopes,
     imports: &mut Vec<ImportDecl>,
+    env: Environment,
 ) {
     let mut cursor = root.walk();
     for child in root.named_children(&mut cursor) {
         match child.kind() {
+            "if_statement" => {
+                handle_env_if(child, path, src, next_id, symbols, scopes, imports);
+            }
             "function_declaration" => {
                 if let Some(name_node) = child.child_by_field_name("name") {
                     let name = node_text(name_node, src.as_bytes()).to_string();
                     let id = *next_id;
                     *next_id += 1;
                     scopes.declare(&name, Binding::Global(id));
-                    symbols.push(symbol(id, &name, SymbolKind::Function, path, child));
+                    symbols.push(symbol(id, &name, SymbolKind::Function, path, child, env));
                 }
             }
             "export_statement" => {
@@ -165,7 +267,14 @@ fn collect_globals(
                                 let id = *next_id;
                                 *next_id += 1;
                                 scopes.declare(&name, Binding::Global(id));
-                                symbols.push(symbol(id, &name, SymbolKind::Function, path, decl));
+                                symbols.push(symbol(
+                                    id,
+                                    &name,
+                                    SymbolKind::Function,
+                                    path,
+                                    decl,
+                                    env,
+                                ));
                             }
                         }
                         "class_declaration" => {
@@ -174,7 +283,7 @@ fn collect_globals(
                                 let id = *next_id;
                                 *next_id += 1;
                                 scopes.declare(&name, Binding::Global(id));
-                                symbols.push(symbol(id, &name, SymbolKind::Class, path, decl));
+                                symbols.push(symbol(id, &name, SymbolKind::Class, path, decl, env));
                             }
                         }
                         "lexical_declaration" | "variable_declaration" => {
@@ -192,6 +301,7 @@ fn collect_globals(
                                             SymbolKind::Const,
                                             path,
                                             name_node,
+                                            env,
                                         ));
                                     }
                                 }
@@ -233,6 +343,7 @@ fn collect_globals(
                                                             SymbolKind::Function,
                                                             path,
                                                             right,
+                                                            env,
                                                         ));
                                                     } else {
                                                         // Anonymous function exported as default
@@ -246,6 +357,7 @@ fn collect_globals(
                                                             SymbolKind::Function,
                                                             path,
                                                             right,
+                                                            env,
                                                         ));
                                                     }
                                                 }
@@ -266,6 +378,7 @@ fn collect_globals(
                                                             SymbolKind::Class,
                                                             path,
                                                             right,
+                                                            env,
                                                         ));
                                                     } else {
                                                         // Anonymous class exported as default
@@ -279,6 +392,7 @@ fn collect_globals(
                                                             SymbolKind::Class,
                                                             path,
                                                             right,
+                                                            env,
                                                         ));
                                                     }
                                                 }
@@ -308,6 +422,7 @@ fn collect_globals(
                                                                     SymbolKind::Const,
                                                                     path,
                                                                     prop,
+                                                                    env,
                                                                 ));
                                                             }
                                                         }
@@ -332,6 +447,7 @@ fn collect_globals(
                                                         SymbolKind::Const,
                                                         path,
                                                         right,
+                                                        env,
                                                     ));
                                                 }
                                             }
@@ -353,6 +469,7 @@ fn collect_globals(
                                         SymbolKind::Const,
                                         path,
                                         child,
+                                        env,
                                     ));
                                 }
                             }
@@ -401,6 +518,7 @@ fn collect_globals(
                                                                     SymbolKind::Const,
                                                                     path,
                                                                     prop,
+                                                                    env,
                                                                 ));
                                                             }
                                                         }
@@ -421,7 +539,7 @@ fn collect_globals(
                     let id = *next_id;
                     *next_id += 1;
                     scopes.declare(&name, Binding::Global(id));
-                    symbols.push(symbol(id, &name, SymbolKind::Class, path, child));
+                    symbols.push(symbol(id, &name, SymbolKind::Class, path, child, env));
 
                     // Also parse methods inside the class body
                     if let Some(body) = child.child_by_field_name("body") {
@@ -442,6 +560,7 @@ fn collect_globals(
                                         SymbolKind::Function,
                                         path,
                                         method,
+                                        env,
                                     ));
                                 }
                             }
@@ -480,6 +599,7 @@ fn collect_globals(
                                                             local_name: name.clone(),
                                                             source: module_path.to_string(),
                                                             is_default: true,
+                                                            environment: env,
                                                         });
                                                     }
                                                 }
@@ -499,7 +619,7 @@ fn collect_globals(
                             };
 
                             scopes.declare(&name, Binding::Global(id));
-                            symbols.push(symbol(id, &name, kind, path, name_node));
+                            symbols.push(symbol(id, &name, kind, path, name_node, env));
                         }
                     }
                 }
@@ -531,12 +651,20 @@ fn collect_globals(
                                     let id = *next_id;
                                     *next_id += 1;
                                     scopes.declare(&name, Binding::Global(id));
-                                    symbols.push(symbol(id, &name, SymbolKind::Import, path, n));
+                                    symbols.push(symbol(
+                                        id,
+                                        &name,
+                                        SymbolKind::Import,
+                                        path,
+                                        n,
+                                        env,
+                                    ));
                                     imports.push(ImportDecl {
                                         symbol_id: id,
                                         local_name: name.clone(),
                                         source: source.clone(),
                                         is_default: true,
+                                        environment: env,
                                     });
                                 }
                             }
@@ -553,12 +681,14 @@ fn collect_globals(
                                             SymbolKind::Import,
                                             path,
                                             name_node,
+                                            env,
                                         ));
                                         imports.push(ImportDecl {
                                             symbol_id: id,
                                             local_name: name.clone(),
                                             source: source.clone(),
                                             is_default: false,
+                                            environment: env,
                                         });
                                     }
                                 }
@@ -586,12 +716,14 @@ fn collect_globals(
                                                 SymbolKind::Import,
                                                 path,
                                                 imp,
+                                                env,
                                             ));
                                             imports.push(ImportDecl {
                                                 symbol_id: id,
                                                 local_name: name.clone(),
                                                 source: source.clone(),
                                                 is_default: false,
+                                                environment: env,
                                             });
                                         }
                                     }
@@ -607,28 +739,116 @@ fn collect_globals(
     }
 }
 
+/// Handle a top-level (or else-if-chained) `if` guarded by an environment check,
+/// recursing `collect_globals` into whichever branch(es) matched with the
+/// appropriate [`Environment`]. Unguarded top-level `if`s are left alone, matching
+/// prior behavior (declarations inside them were never hoisted as globals).
+#[allow(clippy::too_many_arguments)]
+fn handle_env_if(
+    if_node: Node,
+    path: &Path,
+    src: &str,
+    next_id: &mut usize,
+    symbols: &mut Vec<Symbol>,
+    scopes: &mut Scopes,
+    imports: &mut Vec<ImportDecl>,
+) {
+    let Some(condition) = if_node.child_by_field_name("condition") else {
+        return;
+    };
+    let Some((cons_env, alt_env)) = detect_env_guard(condition, src.as_bytes()) else {
+        return;
+    };
+    if let Some(consequence) = if_node.child_by_field_name("consequence") {
+        if consequence.kind() == "statement_block" {
+            collect_globals(
+                consequence,
+                path,
+                src,
+                next_id,
+                symbols,
+                scopes,
+                imports,
+                cons_env,
+            );
+        }
+    }
+    if let Some(alternative) = if_node.child_by_field_name("alternative") {
+        if let Some(alt_body) = alternative.named_child(0) {
+            match alt_body.kind() {
+                "statement_block" => {
+                    collect_globals(
+                        alt_body, path, src, next_id, symbols, scopes, imports, alt_env,
+                    );
+                }
+                "if_statement" => {
+                    handle_env_if(alt_body, path, src, next_id, symbols, scopes, imports);
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
 fn collect_refs(
     root: Node,
     src: &str,
     module_id: SymbolId,
     scopes: &mut Scopes,
     refs: &mut Vec<UnresolvedRef>,
+    env_hints: &mut HashMap<SymbolId, Environment>,
 ) {
     let mut cursor = root.walk();
     for child in root.named_children(&mut cursor) {
-        walk_node(child, src, module_id, scopes, refs);
+        walk_node(
+            child,
+            src,
+            module_id,
+            scopes,
+            refs,
+            Environment::Universal,
+            env_hints,
+        );
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn walk_node(
     node: Node,
     src: &str,
     enclosing: SymbolId,
     scopes: &mut Scopes,
     refs: &mut Vec<UnresolvedRef>,
+    env: Environment,
+    env_hints: &mut HashMap<SymbolId, Environment>,
 ) {
     match node.kind() {
         "import_statement" => {}
+        "if_statement" => {
+            let condition = node.child_by_field_name("condition");
+            let guard = condition.and_then(|c| detect_env_guard(c, src.as_bytes()));
+            if let Some(c) = condition {
+                walk_node(c, src, enclosing, scopes, refs, env, env_hints);
+            }
+            let (cons_env, alt_env) = guard.unwrap_or((env, env));
+            if let Some(consequence) = node.child_by_field_name("consequence") {
+                walk_node(
+                    consequence,
+                    src,
+                    enclosing,
+                    scopes,
+                    refs,
+                    cons_env,
+                    env_hints,
+                );
+            }
+            if let Some(alternative) = node.child_by_field_name("alternative") {
+                let mut c = alternative.walk();
+                for child in alternative.named_children(&mut c) {
+                    walk_node(child, src, enclosing, scopes, refs, alt_env, env_hints);
+                }
+            }
+        }
         "class_declaration" => {
             if let Some(name_node) = node.child_by_field_name("name") {
                 let name = node_text(name_node, src.as_bytes()).to_string();
@@ -641,7 +861,7 @@ fn walk_node(
                 if let Some(body) = node.child_by_field_name("body") {
                     let mut c = body.walk();
                     for child in body.named_children(&mut c) {
-                        walk_node(child, src, def_id, scopes, refs);
+                        walk_node(child, src, def_id, scopes, refs, env, env_hints);
                     }
                 }
                 scopes.pop();
@@ -659,7 +879,7 @@ fn walk_node(
             if let Some(body) = node.child_by_field_name("body") {
                 let mut c = body.walk();
                 for child in body.named_children(&mut c) {
-                    walk_node(child, src, def_id, scopes, refs);
+                    walk_node(child, src, def_id, scopes, refs, env, env_hints);
                 }
             }
             scopes.pop();
@@ -670,20 +890,24 @@ fn walk_node(
             }
             let mut c = node.walk();
             for child in node.named_children(&mut c) {
-                walk_node(child, src, enclosing, scopes, refs);
+                walk_node(child, src, enclosing, scopes, refs, env, env_hints);
             }
         }
         "call_expression" => {
-            handle_call(node, src, enclosing, scopes, refs);
+            handle_call(node, src, enclosing, scopes, refs, env, env_hints);
         }
         "identifier" => {
             let name = node_text(node, src.as_bytes()).to_string();
+            if let Some(detected) = env_of_global(&name) {
+                env_hints.entry(enclosing).or_insert(detected);
+            }
             match scopes.resolve(&name) {
                 Some(Binding::Global(id)) if id != enclosing => {
                     refs.push(UnresolvedRef {
                         from: enclosing,
                         target: RefTarget::Symbol(id),
                         kind: RefKind::Static,
+                        environment: env,
                     });
                 }
                 Some(Binding::Local) => {}
@@ -692,6 +916,7 @@ fn walk_node(
                         from: enclosing,
                         target: RefTarget::Name(name),
                         kind: RefKind::Dynamic,
+                        environment: env,
                     });
                 }
             }
@@ -699,7 +924,7 @@ fn walk_node(
         _ => {
             let mut c = node.walk();
             for child in node.named_children(&mut c) {
-                walk_node(child, src, enclosing, scopes, refs);
+                walk_node(child, src, enclosing, scopes, refs, env, env_hints);
             }
         }
     }
@@ -730,12 +955,15 @@ fn bind_locals(node: Node, src: &[u8], scopes: &mut Scopes) {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn handle_call(
     node: Node,
     src: &str,
     enclosing: SymbolId,
     scopes: &mut Scopes,
     refs: &mut Vec<UnresolvedRef>,
+    env: Environment,
+    env_hints: &mut HashMap<SymbolId, Environment>,
 ) {
     if let Some(func) = node.child_by_field_name("function") {
         let fname = node_text(func, src.as_bytes());
@@ -752,6 +980,7 @@ fn handle_call(
                             from: enclosing,
                             target: RefTarget::Name(s.to_string()),
                             kind,
+                            environment: env,
                         });
                     }
                 }
@@ -761,12 +990,13 @@ fn handle_call(
                     from: enclosing,
                     target: RefTarget::Name("eval".into()),
                     kind: RefKind::Dynamic,
+                    environment: env,
                 });
             }
         }
     }
     let mut c = node.walk();
     for child in node.named_children(&mut c) {
-        walk_node(child, src, enclosing, scopes, refs);
+        walk_node(child, src, enclosing, scopes, refs, env, env_hints);
     }
 }

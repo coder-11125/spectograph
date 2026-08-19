@@ -12,7 +12,9 @@ use std::path::Path;
 use entrypoints::scripts_from_pyproject;
 use parse::parse_file;
 use spectograph_analyzer::{discover, AnalyzeError, Analyzer};
-use spectograph_core::ir::{Language, Program, RefKind, Reference, Symbol, SymbolId, SymbolKind};
+use spectograph_core::ir::{
+    Environment, Language, Program, RefKind, Reference, Symbol, SymbolId, SymbolKind,
+};
 
 /// Analyzer for the Python language.
 pub struct PythonAnalyzer;
@@ -63,6 +65,7 @@ impl PythonAnalyzer {
                 from,
                 to,
                 kind: RefKind::Static,
+                environment: Environment::Universal,
             });
         }
         Ok(program)
@@ -163,6 +166,7 @@ impl Analyzer for PythonAnalyzer {
                         from: r.from,
                         to,
                         kind: r.kind,
+                        environment: Environment::Universal,
                     });
                 }
             }
@@ -207,6 +211,7 @@ impl Analyzer for PythonAnalyzer {
                         from: import_id,
                         to: def_id,
                         kind: RefKind::ReExport,
+                        environment: Environment::Universal,
                     });
                 }
             }
@@ -236,6 +241,7 @@ impl Analyzer for PythonAnalyzer {
                             from: module_id,
                             to: sym.id,
                             kind: RefKind::ReExport,
+                            environment: Environment::Universal,
                         });
                     }
                 }
@@ -252,12 +258,14 @@ impl Analyzer for PythonAnalyzer {
                     file: module_file.clone(),
                     span: decl.span,
                     reachable: false,
+                    environment: Environment::Universal,
                 });
                 // module -> export
                 program.references.push(Reference {
                     from: module_id,
                     to: id,
                     kind: RefKind::ReExport,
+                    environment: Environment::Universal,
                 });
                 // export -> definition
                 if let Some(&def_id) = def_index.get(&decl.name) {
@@ -265,6 +273,7 @@ impl Analyzer for PythonAnalyzer {
                         from: id,
                         to: def_id,
                         kind: RefKind::ReExport,
+                        environment: Environment::Universal,
                     });
                 }
             }

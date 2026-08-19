@@ -4,7 +4,9 @@ use std::path::PathBuf;
 
 use spectograph_core::analysis::{self, BloatTier};
 use spectograph_core::cost::CostModel;
-use spectograph_core::ir::{Language, Program, RefKind, Reference, SourceSpan, Symbol, SymbolKind};
+use spectograph_core::ir::{
+    Environment, Language, Program, RefKind, Reference, SourceSpan, Symbol, SymbolKind,
+};
 
 fn sym(id: usize, name: &str, kind: SymbolKind) -> Symbol {
     Symbol {
@@ -14,6 +16,7 @@ fn sym(id: usize, name: &str, kind: SymbolKind) -> Symbol {
         file: PathBuf::from("test.py"),
         span: SourceSpan::new(1, 1, 1, 1),
         reachable: false,
+        environment: Environment::Universal,
     }
 }
 
@@ -35,16 +38,19 @@ fn program() -> Program {
                 from: 0,
                 to: 1,
                 kind: RefKind::Static,
+                environment: Environment::Universal,
             },
             Reference {
                 from: 1,
                 to: 2,
                 kind: RefKind::Static,
+                environment: Environment::Universal,
             },
             Reference {
                 from: 4,
                 to: 5,
                 kind: RefKind::ReExport,
+                environment: Environment::Universal,
             },
         ],
         entrypoints: vec![0],
