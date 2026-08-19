@@ -1,0 +1,6 @@
+{
+  "name": "js-package-main",
+  "version": "1.0.0",
+  "description": "Test fixture for package.json main field resolution",
+  "main": "custom-entry.js"
+}

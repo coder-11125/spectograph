@@ -108,7 +108,10 @@ fn js_inheritance_fixture() {
         "play method should exist"
     );
     // Check that multiple files are parsed
-    assert!(program.symbols.len() > 5, "should have symbols from multiple files");
+    assert!(
+        program.symbols.len() > 5,
+        "should have symbols from multiple files"
+    );
 }
 
 /// js-relative: relative import resolution
@@ -125,7 +128,10 @@ fn js_relative_fixture() {
         "otherFunction should exist"
     );
     // Check that multiple files are parsed
-    assert!(program.symbols.len() > 5, "should have symbols from multiple files");
+    assert!(
+        program.symbols.len() > 5,
+        "should have symbols from multiple files"
+    );
 }
 
 /// js-dynamic: dynamic import patterns
@@ -154,7 +160,64 @@ fn js_commonjs_fixture() {
     let program = analyze("js-commonjs");
     let symbol_names: Vec<_> = program.symbols.iter().map(|s| s.name.clone()).collect();
     // Check that CommonJS patterns are parsed
-    assert!(!symbol_names.is_empty(), "should have symbols from CommonJS files");
+    assert!(
+        !symbol_names.is_empty(),
+        "should have symbols from CommonJS files"
+    );
     // Check that require() calls are handled
-    assert!(program.symbols.len() > 3, "should have symbols from multiple files");
+    assert!(
+        program.symbols.len() > 3,
+        "should have symbols from multiple files"
+    );
+}
+
+/// js-index: index.js resolution for directory requires
+#[test]
+fn js_index_fixture() {
+    let program = analyze("js-index");
+    let symbol_names: Vec<_> = program.symbols.iter().map(|s| s.name.clone()).collect();
+    // Check that index.js file is resolved and parsed
+    assert!(
+        symbol_names.contains(&"helper".to_string()),
+        "helper function from index.js should exist"
+    );
+    // Check that main.js is also parsed
+    assert!(
+        program.symbols.len() > 2,
+        "should have symbols from multiple files"
+    );
+}
+
+/// js-package-main: package.json main field resolution
+#[test]
+fn js_package_main_fixture() {
+    let program = analyze("js-package-main");
+    let symbol_names: Vec<_> = program.symbols.iter().map(|s| s.name.clone()).collect();
+    // Check that custom entry point is parsed
+    assert!(
+        symbol_names.contains(&"customHelper".to_string()),
+        "customHelper from main field should exist"
+    );
+    // Check that main.js is also parsed
+    assert!(
+        program.symbols.len() > 2,
+        "should have symbols from multiple files"
+    );
+}
+
+/// js-node-modules: basic node_modules resolution
+#[test]
+fn js_node_modules_fixture() {
+    let program = analyze("js-node-modules");
+    let symbol_names: Vec<_> = program.symbols.iter().map(|s| s.name.clone()).collect();
+    // Check that node_modules package is resolved and parsed
+    assert!(
+        symbol_names.contains(&"packageHelper".to_string()),
+        "packageHelper from node_modules should exist"
+    );
+    // Check that main.js is also parsed
+    assert!(
+        program.symbols.len() > 2,
+        "should have symbols from multiple files"
+    );
 }

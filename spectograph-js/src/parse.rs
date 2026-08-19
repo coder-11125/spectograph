@@ -218,36 +218,68 @@ fn collect_globals(
                                             match right.kind() {
                                                 "function" | "function_expression" => {
                                                     // module.exports = function() {}
-                                                    if let Some(name_node) = right.child_by_field_name("name") {
-                                                        let name = node_text(name_node, src.as_bytes()).to_string();
+                                                    if let Some(name_node) =
+                                                        right.child_by_field_name("name")
+                                                    {
+                                                        let name =
+                                                            node_text(name_node, src.as_bytes())
+                                                                .to_string();
                                                         let id = *next_id;
                                                         *next_id += 1;
                                                         scopes.declare(&name, Binding::Global(id));
-                                                        symbols.push(symbol(id, &name, SymbolKind::Function, path, right));
+                                                        symbols.push(symbol(
+                                                            id,
+                                                            &name,
+                                                            SymbolKind::Function,
+                                                            path,
+                                                            right,
+                                                        ));
                                                     } else {
                                                         // Anonymous function exported as default
                                                         let name = "default".to_string();
                                                         let id = *next_id;
                                                         *next_id += 1;
                                                         scopes.declare(&name, Binding::Global(id));
-                                                        symbols.push(symbol(id, &name, SymbolKind::Function, path, right));
+                                                        symbols.push(symbol(
+                                                            id,
+                                                            &name,
+                                                            SymbolKind::Function,
+                                                            path,
+                                                            right,
+                                                        ));
                                                     }
                                                 }
                                                 "class_expression" => {
                                                     // module.exports = class {}
-                                                    if let Some(name_node) = right.child_by_field_name("name") {
-                                                        let name = node_text(name_node, src.as_bytes()).to_string();
+                                                    if let Some(name_node) =
+                                                        right.child_by_field_name("name")
+                                                    {
+                                                        let name =
+                                                            node_text(name_node, src.as_bytes())
+                                                                .to_string();
                                                         let id = *next_id;
                                                         *next_id += 1;
                                                         scopes.declare(&name, Binding::Global(id));
-                                                        symbols.push(symbol(id, &name, SymbolKind::Class, path, right));
+                                                        symbols.push(symbol(
+                                                            id,
+                                                            &name,
+                                                            SymbolKind::Class,
+                                                            path,
+                                                            right,
+                                                        ));
                                                     } else {
                                                         // Anonymous class exported as default
                                                         let name = "default".to_string();
                                                         let id = *next_id;
                                                         *next_id += 1;
                                                         scopes.declare(&name, Binding::Global(id));
-                                                        symbols.push(symbol(id, &name, SymbolKind::Class, path, right));
+                                                        symbols.push(symbol(
+                                                            id,
+                                                            &name,
+                                                            SymbolKind::Class,
+                                                            path,
+                                                            right,
+                                                        ));
                                                     }
                                                 }
                                                 "object_expression" => {
@@ -256,19 +288,35 @@ fn collect_globals(
                                                     let mut oc = right.walk();
                                                     for prop in right.named_children(&mut oc) {
                                                         if prop.kind() == "pair" {
-                                                            if let Some(key_node) = prop.child_by_field_name("key") {
-                                                                let key = node_text(key_node, src.as_bytes()).to_string();
+                                                            if let Some(key_node) =
+                                                                prop.child_by_field_name("key")
+                                                            {
+                                                                let key = node_text(
+                                                                    key_node,
+                                                                    src.as_bytes(),
+                                                                )
+                                                                .to_string();
                                                                 let id = *next_id;
                                                                 *next_id += 1;
-                                                                scopes.declare(&key, Binding::Global(id));
-                                                                symbols.push(symbol(id, &key, SymbolKind::Const, path, prop));
+                                                                scopes.declare(
+                                                                    &key,
+                                                                    Binding::Global(id),
+                                                                );
+                                                                symbols.push(symbol(
+                                                                    id,
+                                                                    &key,
+                                                                    SymbolKind::Const,
+                                                                    path,
+                                                                    prop,
+                                                                ));
                                                             }
                                                         }
                                                     }
                                                 }
                                                 "identifier" => {
                                                     // module.exports = existingVariable
-                                                    let _name = node_text(right, src.as_bytes()).to_string();
+                                                    let _name = node_text(right, src.as_bytes())
+                                                        .to_string();
                                                     // Just create a reference, not a new symbol
                                                     // The symbol should already exist from the variable declaration
                                                 }
@@ -278,7 +326,13 @@ fn collect_globals(
                                                     let id = *next_id;
                                                     *next_id += 1;
                                                     scopes.declare(&name, Binding::Global(id));
-                                                    symbols.push(symbol(id, &name, SymbolKind::Const, path, right));
+                                                    symbols.push(symbol(
+                                                        id,
+                                                        &name,
+                                                        SymbolKind::Const,
+                                                        path,
+                                                        right,
+                                                    ));
                                                 }
                                             }
                                         }
@@ -287,12 +341,19 @@ fn collect_globals(
                             } else if object_text == "exports" {
                                 // This is exports.something = value
                                 if let Some(property) = left.child_by_field_name("property") {
-                                    let property_name = node_text(property, src.as_bytes()).to_string();
+                                    let property_name =
+                                        node_text(property, src.as_bytes()).to_string();
                                     // Create an export symbol for this property
                                     let id = *next_id;
                                     *next_id += 1;
                                     scopes.declare(&property_name, Binding::Global(id));
-                                    symbols.push(symbol(id, &property_name, SymbolKind::Const, path, child));
+                                    symbols.push(symbol(
+                                        id,
+                                        &property_name,
+                                        SymbolKind::Const,
+                                        path,
+                                        child,
+                                    ));
                                 }
                             }
                         }
@@ -320,12 +381,27 @@ fn collect_globals(
                                                     let mut oc = second_arg.walk();
                                                     for prop in second_arg.named_children(&mut oc) {
                                                         if prop.kind() == "pair" {
-                                                            if let Some(key_node) = prop.child_by_field_name("key") {
-                                                                let key = node_text(key_node, src.as_bytes()).to_string();
+                                                            if let Some(key_node) =
+                                                                prop.child_by_field_name("key")
+                                                            {
+                                                                let key = node_text(
+                                                                    key_node,
+                                                                    src.as_bytes(),
+                                                                )
+                                                                .to_string();
                                                                 let id = *next_id;
                                                                 *next_id += 1;
-                                                                scopes.declare(&key, Binding::Global(id));
-                                                                symbols.push(symbol(id, &key, SymbolKind::Const, path, prop));
+                                                                scopes.declare(
+                                                                    &key,
+                                                                    Binding::Global(id),
+                                                                );
+                                                                symbols.push(symbol(
+                                                                    id,
+                                                                    &key,
+                                                                    SymbolKind::Const,
+                                                                    path,
+                                                                    prop,
+                                                                ));
                                                             }
                                                         }
                                                     }
@@ -381,7 +457,7 @@ fn collect_globals(
                             let name = node_text(name_node, src.as_bytes()).to_string();
                             let id = *next_id;
                             *next_id += 1;
-                            
+
                             // Check if this is a require() call
                             let kind = if let Some(value) = decl.child_by_field_name("value") {
                                 if value.kind() == "call_expression" {
@@ -389,12 +465,15 @@ fn collect_globals(
                                         let fname = node_text(func, src.as_bytes());
                                         if fname == "require" {
                                             // Extract module path
-                                            if let Some(arg) = value.child_by_field_name("arguments") {
+                                            if let Some(arg) =
+                                                value.child_by_field_name("arguments")
+                                            {
                                                 let mut ac = arg.walk();
                                                 let first = arg.named_children(&mut ac).next();
                                                 if let Some(first_node) = first {
                                                     let v = node_text(first_node, src.as_bytes());
-                                                    let module_path = v.trim_matches(['\'', '"', '`']);
+                                                    let module_path =
+                                                        v.trim_matches(['\'', '"', '`']);
                                                     if !module_path.is_empty() {
                                                         imports.push(ImportDecl {
                                                             symbol_id: id,
@@ -418,7 +497,7 @@ fn collect_globals(
                             } else {
                                 SymbolKind::Const
                             };
-                            
+
                             scopes.declare(&name, Binding::Global(id));
                             symbols.push(symbol(id, &name, kind, path, name_node));
                         }

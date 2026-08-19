@@ -97,7 +97,10 @@ fn cross_file_import_parses_both_files() {
         ("utils.js", "export function helper() { return 2; }"),
     ]);
     // Check that both files are parsed
-    assert!(program.symbols.len() > 2, "should have symbols from both files");
+    assert!(
+        program.symbols.len() > 2,
+        "should have symbols from both files"
+    );
     // Check that helper function exists
     let helper = program.symbols.iter().find(|s| s.name == "helper");
     assert!(helper.is_some(), "helper should be a symbol");
@@ -111,9 +114,15 @@ fn aliased_import_is_parsed() {
         ("utils.js", "export function helper() { return 2; }"),
     ]);
     // Check that the import statement is parsed and creates symbols
-    assert!(!program.symbols.is_empty(), "should have symbols from import statement");
+    assert!(
+        !program.symbols.is_empty(),
+        "should have symbols from import statement"
+    );
     // Check that both files are parsed
-    assert!(program.symbols.len() > 2, "should have symbols from both files");
+    assert!(
+        program.symbols.len() > 2,
+        "should have symbols from both files"
+    );
 }
 
 /// Default import - test that import statements are parsed.
@@ -124,9 +133,15 @@ fn default_import_is_parsed() {
         ("utils.js", "export default function helper() { return 2; }"),
     ]);
     // Check that the import statement is parsed
-    assert!(!program.symbols.is_empty(), "should have symbols from import statement");
+    assert!(
+        !program.symbols.is_empty(),
+        "should have symbols from import statement"
+    );
     // Check that both files are parsed
-    assert!(program.symbols.len() > 2, "should have symbols from both files");
+    assert!(
+        program.symbols.len() > 2,
+        "should have symbols from both files"
+    );
 }
 
 /// A function referenced only through bracket notation - test that parsing handles it.
@@ -215,7 +230,10 @@ fn re_export_chain_parses_all_files() {
         ("utils.js", "export function helper() { return 2; }"),
     ]);
     // Check that all three files are parsed
-    assert!(program.symbols.len() > 3, "should have symbols from all three files");
+    assert!(
+        program.symbols.len() > 3,
+        "should have symbols from all three files"
+    );
     // Check that helper function exists
     let helper = program.symbols.iter().find(|s| s.name == "helper");
     assert!(helper.is_some(), "helper should be a symbol");
@@ -230,7 +248,10 @@ fn export_from_parses_all_files() {
         ("utils.js", "export function helper() { return 2; }"),
     ]);
     // Check that all three files are parsed
-    assert!(program.symbols.len() > 3, "should have symbols from all three files");
+    assert!(
+        program.symbols.len() > 3,
+        "should have symbols from all three files"
+    );
 }
 
 /// Unused imports should be flagged as bloat.
@@ -269,12 +290,12 @@ main();"#,
 /// Namespace import - test that the import statement is parsed.
 #[test]
 fn namespace_import_is_parsed() {
-    let program = analyze_js(&[(
-        "test.js",
-        "import * as utils from './utils.js';",
-    )]);
+    let program = analyze_js(&[("test.js", "import * as utils from './utils.js';")]);
     // Check that the import creates some symbols
-    assert!(!program.symbols.is_empty(), "should have symbols from import statement");
+    assert!(
+        !program.symbols.is_empty(),
+        "should have symbols from import statement"
+    );
 }
 
 /// Class inheritance - test that both parent and child classes are parsed.
@@ -405,10 +426,7 @@ fn exports_property_creates_symbol() {
 /// CommonJS exports.CONSTANT = value should create symbol.
 #[test]
 fn exports_constant_creates_symbol() {
-    let program = analyze_js(&[(
-        "test.js",
-        r#"exports.CONSTANT = 'value';"#,
-    )]);
+    let program = analyze_js(&[("test.js", r#"exports.CONSTANT = 'value';"#)]);
     // For now, just check that the file is parsed
     assert!(!program.symbols.is_empty(), "should have symbols");
 }
@@ -416,22 +434,19 @@ fn exports_constant_creates_symbol() {
 /// CommonJS const x = require('module') should create Import symbol.
 #[test]
 fn require_creates_import_symbol() {
-    let program = analyze_js(&[(
-        "test.js",
-        r#"const helper = require('./utils.js');"#,
-    )]);
+    let program = analyze_js(&[("test.js", r#"const helper = require('./utils.js');"#)]);
     // Check that import symbols are created
-    let import = program.symbols.iter().find(|s| s.kind == SymbolKind::Import);
+    let import = program
+        .symbols
+        .iter()
+        .find(|s| s.kind == SymbolKind::Import);
     assert!(import.is_some(), "require should create import symbol");
 }
 
 /// CommonJS const { foo } = require('module') should create Import symbol.
 #[test]
 fn require_destructuring_creates_import_symbol() {
-    let program = analyze_js(&[(
-        "test.js",
-        r#"const { foo } = require('./module.js');"#,
-    )]);
+    let program = analyze_js(&[("test.js", r#"const { foo } = require('./module.js');"#)]);
     // For now, just check that the file is parsed
     assert!(!program.symbols.is_empty(), "should have symbols");
 }
@@ -471,23 +486,91 @@ fn conditional_exports_creates_symbols() {
 #[test]
 fn commonjs_cross_file_require_creates_references() {
     let program = analyze_js(&[
-        ("main.js", "const helper = require('./utils.js');\nhelper();"),
-        ("utils.js", "exports.helper = function() { return 'hello'; };"),
+        (
+            "main.js",
+            "const helper = require('./utils.js');\nhelper();",
+        ),
+        (
+            "utils.js",
+            "exports.helper = function() { return 'hello'; };",
+        ),
     ]);
     // For now, just check that both files are parsed
-    assert!(program.symbols.len() > 2, "should have symbols from both files");
+    assert!(
+        program.symbols.len() > 2,
+        "should have symbols from both files"
+    );
 }
 
 /// CommonJS module.exports = function should be resolvable via require.
 #[test]
 fn commonjs_module_exports_function_resolvable() {
     let program = analyze_js(&[
-        ("main.js", "const myFunc = require('./module.js');\nmyFunc();"),
-        ("module.js", "module.exports = function myFunc() { return 'test'; };"),
+        (
+            "main.js",
+            "const myFunc = require('./module.js');\nmyFunc();",
+        ),
+        (
+            "module.js",
+            "module.exports = function myFunc() { return 'test'; };",
+        ),
     ]);
     // Check that references are created
     assert!(!program.references.is_empty(), "should have references");
     // Check that the function is parsed
     let my_func = program.symbols.iter().find(|s| s.name == "myFunc");
     assert!(my_func.is_some(), "myFunc should be a symbol");
+}
+
+/// Node.js file extension resolution (.js extension auto-added)
+#[test]
+fn nodejs_file_extension_resolution() {
+    let program = analyze_js(&[
+        ("main.js", "const helper = require('./utils');\nhelper();"),
+        (
+            "utils.js",
+            "function helper() { return 'hello'; }\nmodule.exports = helper;",
+        ),
+    ]);
+    // Check that both files are parsed despite requiring './utils' instead of './utils.js'
+    assert!(
+        program.symbols.len() > 2,
+        "should have symbols from both files"
+    );
+}
+
+/// Node.js index.js resolution for directory requires
+#[test]
+fn nodejs_index_file_resolution() {
+    let program = analyze_js(&[
+        ("main.js", "const helper = require('./lib');\nhelper();"),
+        (
+            "lib/index.js",
+            "function helper() { return 'hello'; }\nmodule.exports = helper;",
+        ),
+    ]);
+    // Check that index.js is resolved and parsed
+    assert!(
+        program.symbols.len() > 2,
+        "should have symbols from both files"
+    );
+    let has_helper = program.symbols.iter().any(|s| s.name == "helper");
+    assert!(has_helper, "helper function should exist");
+}
+
+/// Node.js package.json main field resolution
+#[test]
+fn nodejs_package_main_resolution() {
+    let program = analyze_js(&[
+        ("main.js", "const helper = require('./custom');\nhelper();"),
+        (
+            "custom.js",
+            "function helper() { return 'hello'; }\nmodule.exports = helper;",
+        ),
+    ]);
+    // Check that the custom file is resolved
+    assert!(
+        program.symbols.len() > 2,
+        "should have symbols from both files"
+    );
 }

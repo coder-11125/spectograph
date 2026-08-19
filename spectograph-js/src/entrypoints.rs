@@ -62,8 +62,7 @@ pub fn detect_entrypoint_symbols(
     // For now, mark all top-level module symbols as potential entrypoints
     // (This is conservative; we'll refine based on usage patterns)
     for sym in &program.symbols {
-        if sym.kind == spectograph_core::ir::SymbolKind::Module
-            && !entrypoints.contains(&sym.id) {
+        if sym.kind == spectograph_core::ir::SymbolKind::Module && !entrypoints.contains(&sym.id) {
             // Only add if it's a real JS file (not node_modules, etc.)
             if sym.file.to_string_lossy().contains("node_modules") {
                 continue;

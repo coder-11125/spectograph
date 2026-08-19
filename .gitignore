@@ -2,3 +2,5 @@
 Cargo.lock
 .git-commit-msg
 .log
+.omc/
+.claude/

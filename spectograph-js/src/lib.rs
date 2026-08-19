@@ -6,15 +6,92 @@ pub mod entrypoints;
 pub mod parse;
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use entrypoints::detect_entrypoint_symbols;
 use parse::parse_file;
+use serde_json::Value;
 use spectograph_analyzer::{discover, AnalyzeError, Analyzer};
 use spectograph_core::ir::{Language, Program, RefKind, Reference, SymbolId, SymbolKind};
 
 /// Analyzer for the JavaScript language.
 pub struct JavaScriptAnalyzer;
+
+/// Node.js-style module resolution helper
+fn resolve_module_path(base: &Path, module_path: &str, _root: &Path) -> PathBuf {
+    // Handle absolute paths
+    if module_path.starts_with('/') || module_path.starts_with("\\") {
+        return PathBuf::from(module_path);
+    }
+
+    // Handle relative paths (starting with '.' or '..')
+    if module_path.starts_with('.') {
+        let path = base.join(module_path);
+
+        // If the path doesn't have an extension, try .js
+        if path.extension().is_none() {
+            let with_js = path.with_extension("js");
+            if with_js.exists() {
+                return with_js;
+            }
+        }
+
+        // If path is a directory, try index.js
+        if path.is_dir() {
+            let index_path = path.join("index.js");
+            if index_path.exists() {
+                return index_path;
+            }
+        }
+
+        return path;
+    }
+
+    // Handle node_modules packages (non-relative imports)
+    // Walk up the directory tree looking for node_modules
+    let mut current = base;
+    loop {
+        let node_modules = current.join("node_modules").join(module_path);
+
+        // Try the package path
+        if node_modules.exists() {
+            if node_modules.is_dir() {
+                // Check for package.json main field
+                let package_json = node_modules.join("package.json");
+                if package_json.exists() {
+                    if let Ok(content) = std::fs::read_to_string(&package_json) {
+                        if let Ok(json) = serde_json::from_str::<Value>(&content) {
+                            if let Some(main) = json.get("main").and_then(|m| m.as_str()) {
+                                let main_path = node_modules.join(main);
+                                if main_path.exists() {
+                                    return main_path;
+                                }
+                            }
+                        }
+                    }
+                    // Fall back to index.js
+                    let index_path = node_modules.join("index.js");
+                    if index_path.exists() {
+                        return index_path;
+                    }
+                }
+            } else {
+                // It's a file, return it
+                return node_modules;
+            }
+        }
+
+        // Move up to parent directory
+        if let Some(parent) = current.parent() {
+            current = parent;
+        } else {
+            break;
+        }
+    }
+
+    // Fallback: just return the path as-is (will fail later)
+    base.join(module_path)
+}
 
 impl Analyzer for JavaScriptAnalyzer {
     fn language(&self) -> Language {
@@ -113,13 +190,13 @@ impl Analyzer for JavaScriptAnalyzer {
         // For CommonJS: const x = require("y") -> link Import symbol to definition in module y
         for (_path, result) in &parsed {
             for imp in &result.imports {
-                // Resolve the source module
+                // Resolve the source module with Node.js-style resolution
                 let source_path = result
                     .symbols
                     .iter()
                     .find(|s| s.kind == SymbolKind::Module)
                     .map(|s| s.file.parent().unwrap_or(&s.file))
-                    .map(|p| p.join(&imp.source))
+                    .map(|p| resolve_module_path(p, &imp.source, root))
                     .unwrap_or_else(|| root.join(&imp.source));
 
                 let source_path_str = source_path.to_string_lossy().into_owned();
