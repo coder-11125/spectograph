@@ -4,6 +4,7 @@
 
 pub mod entrypoints;
 pub mod parse;
+pub mod react;
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -322,12 +323,34 @@ fn resolve_module_path(
     (base.join(module_path), Environment::Universal)
 }
 
-impl Analyzer for JavaScriptAnalyzer {
-    fn language(&self) -> Language {
-        Language::JavaScript
+/// React-specific facts gathered alongside the regular [`Program`] IR by
+/// [`JavaScriptAnalyzer::analyze_react`]. See [`react`] for what each field means.
+#[derive(Debug, Clone, Default)]
+pub struct ReactAnalysis {
+    pub components: Vec<react::ReactComponent>,
+    pub jsx_usages: Vec<react::JsxUsage>,
+    pub hook_calls: Vec<react::HookCall>,
+}
+
+impl JavaScriptAnalyzer {
+    /// Like [`Analyzer::analyze`], but also returns React component/prop/hook
+    /// data collected from JSX while parsing. Doesn't re-parse anything -- both
+    /// results come from the same pass over the source.
+    pub fn analyze_react(&self, root: &Path) -> Result<(Program, ReactAnalysis), AnalyzeError> {
+        let (program, parsed) = self.analyze_impl(root)?;
+        let mut react = ReactAnalysis::default();
+        for (_path, result) in parsed {
+            react.components.extend(result.components);
+            react.jsx_usages.extend(result.jsx_usages);
+            react.hook_calls.extend(result.hook_calls);
+        }
+        Ok((program, react))
     }
 
-    fn analyze(&self, root: &Path) -> Result<Program, AnalyzeError> {
+    fn analyze_impl(
+        &self,
+        root: &Path,
+    ) -> Result<(Program, Vec<(String, parse::FileResult)>), AnalyzeError> {
         let files = discover::discover_files(root, Language::JavaScript)?;
         if files.is_empty() {
             return Err(AnalyzeError::NoSourceFiles(root.display().to_string()));
@@ -487,6 +510,16 @@ impl Analyzer for JavaScriptAnalyzer {
         program.entrypoints = detect_entrypoint_symbols(&program, &file_module, root)
             .map_err(|e| std::io::Error::other(e.to_string()))?;
 
-        Ok(program)
+        Ok((program, parsed))
+    }
+}
+
+impl Analyzer for JavaScriptAnalyzer {
+    fn language(&self) -> Language {
+        Language::JavaScript
+    }
+
+    fn analyze(&self, root: &Path) -> Result<Program, AnalyzeError> {
+        self.analyze_impl(root).map(|(program, _parsed)| program)
     }
 }

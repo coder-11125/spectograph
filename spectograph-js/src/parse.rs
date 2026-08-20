@@ -6,6 +6,8 @@ use std::path::Path;
 use spectograph_core::ir::{Environment, RefKind, SourceSpan, Symbol, SymbolId, SymbolKind};
 use tree_sitter::{Node, Parser};
 
+use crate::react::{is_component_name, is_hook_name, HookCall, JsxUsage, ReactComponent};
+
 /// Environment-indicative globals: identifiers whose mere presence in `typeof X`
 /// (a guard) or as a bare reference signals that surrounding code targets one
 /// runtime specifically.
@@ -123,6 +125,9 @@ pub struct FileResult {
     pub symbols: Vec<Symbol>,
     pub refs: Vec<UnresolvedRef>,
     pub imports: Vec<ImportDecl>,
+    pub components: Vec<ReactComponent>,
+    pub jsx_usages: Vec<JsxUsage>,
+    pub hook_calls: Vec<HookCall>,
 }
 
 pub struct ImportDecl {
@@ -237,11 +242,284 @@ pub fn parse_file(path: &Path, src: &str, module_id: SymbolId, next_id: &mut usi
         }
     }
 
+    let (components, jsx_usages, hook_calls) = detect_react(root, path, src, module_id, &symbols);
+
     FileResult {
         module_id,
         symbols,
         refs,
         imports,
+        components,
+        jsx_usages,
+        hook_calls,
+    }
+}
+
+/// True if `node`'s subtree contains a JSX element anywhere -- i.e. this is
+/// (part of) something that renders.
+fn contains_jsx(node: Node) -> bool {
+    if matches!(node.kind(), "jsx_element" | "jsx_self_closing_element") {
+        return true;
+    }
+    let mut c = node.walk();
+    let found = node.named_children(&mut c).any(contains_jsx);
+    found
+}
+
+/// Extract prop names destructured from a component's first parameter
+/// (`{ label, onClick, disabled = false }`). Returns empty if the parameter isn't
+/// a destructuring pattern (e.g. a bare `props`), since we then can't statically
+/// enumerate what's read off it.
+fn destructured_prop_names(params: Node, src: &[u8]) -> Vec<String> {
+    let mut c = params.walk();
+    let Some(first) = params.named_children(&mut c).next() else {
+        return Vec::new();
+    };
+    if first.kind() != "object_pattern" {
+        return Vec::new();
+    }
+    let mut names = Vec::new();
+    let mut pc = first.walk();
+    for prop in first.named_children(&mut pc) {
+        match prop.kind() {
+            "shorthand_property_identifier_pattern" => {
+                names.push(node_text(prop, src).to_string());
+            }
+            "pair_pattern" => {
+                if let Some(key) = prop.child_by_field_name("key") {
+                    names.push(node_text(key, src).to_string());
+                }
+            }
+            "object_assignment_pattern" => {
+                // `{ label = 'default' }`
+                if let Some(left) = prop.child_by_field_name("left") {
+                    if left.kind() == "shorthand_property_identifier_pattern" {
+                        names.push(node_text(left, src).to_string());
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    names
+}
+
+/// Detect React components, JSX usage sites, and hook calls in one file.
+///
+/// This is deliberately a separate, simpler pass rather than folded into
+/// [`collect_globals`]/[`collect_refs`]: it needs no scope/binding tracking, just
+/// structural pattern matching plus "which named declaration am I inside", so
+/// keeping it isolated avoids adding more parameters to the already-complex
+/// scope-resolution recursion.
+fn detect_react(
+    root: Node,
+    path: &Path,
+    src: &str,
+    module_id: SymbolId,
+    symbols: &[Symbol],
+) -> (Vec<ReactComponent>, Vec<JsxUsage>, Vec<HookCall>) {
+    // Name -> id for this file's top-level declarations, so JSX/hook detection
+    // (which doesn't track scope) can still attribute things to the right symbol.
+    let mut name_to_id: HashMap<String, SymbolId> = HashMap::new();
+    for s in symbols {
+        if s.kind != SymbolKind::Module {
+            name_to_id.entry(s.name.clone()).or_insert(s.id);
+        }
+    }
+
+    let mut components = Vec::new();
+
+    // Component detection: top-level (and exported) function/const declarations
+    // whose name is PascalCase and whose body renders JSX.
+    let mut cursor = root.walk();
+    for child in root.named_children(&mut cursor) {
+        let decl = if child.kind() == "export_statement" {
+            child.child_by_field_name("declaration").unwrap_or(child)
+        } else {
+            child
+        };
+        match decl.kind() {
+            "function_declaration" => {
+                if let (Some(name_node), Some(body)) = (
+                    decl.child_by_field_name("name"),
+                    decl.child_by_field_name("body"),
+                ) {
+                    let name = node_text(name_node, src.as_bytes()).to_string();
+                    if is_component_name(&name) && contains_jsx(body) {
+                        if let Some(&id) = name_to_id.get(&name) {
+                            let declared_props = decl
+                                .child_by_field_name("parameters")
+                                .map(|p| destructured_prop_names(p, src.as_bytes()))
+                                .unwrap_or_default();
+                            components.push(ReactComponent {
+                                symbol_id: id,
+                                name,
+                                file: path.to_path_buf(),
+                                line: span(decl).start_line,
+                                declared_props,
+                            });
+                        }
+                    }
+                }
+            }
+            "lexical_declaration" | "variable_declaration" => {
+                let mut dc = decl.walk();
+                for d in decl.named_children(&mut dc) {
+                    if d.kind() != "variable_declarator" {
+                        continue;
+                    }
+                    let (Some(name_node), Some(value)) = (
+                        d.child_by_field_name("name"),
+                        d.child_by_field_name("value"),
+                    ) else {
+                        continue;
+                    };
+                    if !matches!(value.kind(), "arrow_function" | "function_expression") {
+                        continue;
+                    }
+                    let name = node_text(name_node, src.as_bytes()).to_string();
+                    let body_has_jsx = value
+                        .child_by_field_name("body")
+                        .map(contains_jsx)
+                        .unwrap_or(false);
+                    if is_component_name(&name) && body_has_jsx {
+                        if let Some(&id) = name_to_id.get(&name) {
+                            let declared_props = value
+                                .child_by_field_name("parameters")
+                                .map(|p| destructured_prop_names(p, src.as_bytes()))
+                                .unwrap_or_default();
+                            components.push(ReactComponent {
+                                symbol_id: id,
+                                name,
+                                file: path.to_path_buf(),
+                                line: span(d).start_line,
+                                declared_props,
+                            });
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut jsx_usages = Vec::new();
+    let mut hook_calls = Vec::new();
+    scan_jsx_and_hooks(
+        root,
+        path,
+        src,
+        &name_to_id,
+        module_id,
+        &mut jsx_usages,
+        &mut hook_calls,
+    );
+
+    (components, jsx_usages, hook_calls)
+}
+
+/// Recursively collect JSX usage sites (`<Component prop={x} />`) and hook calls
+/// (`useXxx(...)`), tracking which named function declaration each is nested in so
+/// hook calls can be attributed to the right component/custom hook.
+#[allow(clippy::too_many_arguments)]
+fn scan_jsx_and_hooks(
+    node: Node,
+    path: &Path,
+    src: &str,
+    name_to_id: &HashMap<String, SymbolId>,
+    enclosing: SymbolId,
+    jsx_usages: &mut Vec<JsxUsage>,
+    hook_calls: &mut Vec<HookCall>,
+) {
+    match node.kind() {
+        "variable_declarator" => {
+            if let Some(value) = node.child_by_field_name("value") {
+                if matches!(value.kind(), "arrow_function" | "function_expression") {
+                    let new_enclosing = node
+                        .child_by_field_name("name")
+                        .map(|n| node_text(n, src.as_bytes()).to_string())
+                        .and_then(|name| name_to_id.get(&name).copied())
+                        .unwrap_or(enclosing);
+                    scan_jsx_and_hooks(
+                        value,
+                        path,
+                        src,
+                        name_to_id,
+                        new_enclosing,
+                        jsx_usages,
+                        hook_calls,
+                    );
+                    return;
+                }
+            }
+        }
+        "function_declaration" | "method_definition" => {
+            let new_enclosing = node
+                .child_by_field_name("name")
+                .map(|n| node_text(n, src.as_bytes()).to_string())
+                .and_then(|name| name_to_id.get(&name).copied())
+                .unwrap_or(enclosing);
+            let mut c = node.walk();
+            for child in node.named_children(&mut c) {
+                scan_jsx_and_hooks(
+                    child,
+                    path,
+                    src,
+                    name_to_id,
+                    new_enclosing,
+                    jsx_usages,
+                    hook_calls,
+                );
+            }
+            return;
+        }
+        "jsx_opening_element" | "jsx_self_closing_element" => {
+            if let Some(name_node) = node.child_by_field_name("name") {
+                if name_node.kind() == "identifier" {
+                    let name = node_text(name_node, src.as_bytes()).to_string();
+                    if is_component_name(&name) {
+                        let mut passed_props = Vec::new();
+                        let mut ac = node.walk();
+                        for attr in node.children_by_field_name("attribute", &mut ac) {
+                            if attr.kind() == "jsx_attribute" {
+                                if let Some(prop_name) = attr.named_child(0) {
+                                    passed_props
+                                        .push(node_text(prop_name, src.as_bytes()).to_string());
+                                }
+                            }
+                        }
+                        jsx_usages.push(JsxUsage {
+                            component_name: name,
+                            file: path.to_path_buf(),
+                            line: span(node).start_line,
+                            passed_props,
+                        });
+                    }
+                }
+            }
+        }
+        "call_expression" => {
+            if let Some(func) = node.child_by_field_name("function") {
+                if func.kind() == "identifier" {
+                    let name = node_text(func, src.as_bytes()).to_string();
+                    if is_hook_name(&name) {
+                        hook_calls.push(HookCall {
+                            enclosing,
+                            hook_name: name,
+                            file: path.to_path_buf(),
+                            line: span(node).start_line,
+                        });
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+    let mut c = node.walk();
+    for child in node.named_children(&mut c) {
+        scan_jsx_and_hooks(
+            child, path, src, name_to_id, enclosing, jsx_usages, hook_calls,
+        );
     }
 }
 
@@ -654,7 +932,18 @@ fn collect_globals(
                     continue;
                 }
 
-                let import_clause = child.child_by_field_name("import_clause");
+                // `import_clause` is a plain typed child of `import_statement`, not a
+                // named field in this grammar version -- `child_by_field_name` always
+                // returns None for it, so ES6 `import ... from` bindings (default,
+                // named, and namespace) never created symbols. Find it by kind instead.
+                let mut import_clause = None;
+                let mut ic = child.walk();
+                for n in child.named_children(&mut ic) {
+                    if n.kind() == "import_clause" {
+                        import_clause = Some(n);
+                        break;
+                    }
+                }
                 if let Some(clause) = import_clause {
                     let mut c = clause.walk();
                     for n in clause.named_children(&mut c) {
