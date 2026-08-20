@@ -17,6 +17,7 @@ fn sym(id: usize, name: &str, kind: SymbolKind) -> Symbol {
         span: SourceSpan::new(1, 1, 1, 1),
         reachable: false,
         environment: Environment::Universal,
+        is_external: false,
     }
 }
 

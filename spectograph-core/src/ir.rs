@@ -110,6 +110,12 @@ pub struct Symbol {
     pub reachable: bool,
     /// The runtime this symbol is scoped to, when an analyzer can tell.
     pub environment: Environment,
+    /// True if this symbol belongs to third-party library code (e.g. a
+    /// `node_modules` package) rather than the project being analyzed. External
+    /// symbols are excluded from bloat findings: their unreachable internals aren't
+    /// actionable, and an analyzer's resolution heuristics are lower-fidelity for
+    /// arbitrary dependency code than for the project's own source.
+    pub is_external: bool,
 }
 
 /// The runtime a [`Symbol`] or [`Reference`] is scoped to.

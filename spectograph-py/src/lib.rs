@@ -259,6 +259,7 @@ impl Analyzer for PythonAnalyzer {
                     span: decl.span,
                     reachable: false,
                     environment: Environment::Universal,
+                    is_external: false,
                 });
                 // module -> export
                 program.references.push(Reference {

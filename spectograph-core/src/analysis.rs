@@ -86,9 +86,11 @@ pub fn analyze(program: &mut Program, model: &CostModel) -> Report {
 
     for sym in &program.symbols {
         // Modules and exports are structural/public declarations; skip. Entrypoints
-        // are user-designated roots and are never bloat.
+        // are user-designated roots and are never bloat. External (third-party
+        // library) symbols aren't actionable, so they're never reported either.
         if matches!(sym.kind, SymbolKind::Module | SymbolKind::Export)
             || program.entrypoints.contains(&sym.id)
+            || sym.is_external
         {
             continue;
         }

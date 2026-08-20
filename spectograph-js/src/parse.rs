@@ -173,7 +173,14 @@ fn symbol(
         span: span(node),
         reachable: false,
         environment,
+        is_external: false,
     }
+}
+
+/// True if `path` has a `node_modules` component: third-party library code
+/// rather than the project being analyzed.
+fn is_under_node_modules(path: &Path) -> bool {
+    path.components().any(|c| c.as_os_str() == "node_modules")
 }
 
 /// Parse a single JavaScript file.
@@ -220,6 +227,13 @@ pub fn parse_file(path: &Path, src: &str, module_id: SymbolId, next_id: &mut usi
             if let Some(&hint) = env_hints.get(&sym.id) {
                 sym.environment = hint;
             }
+        }
+    }
+
+    // Everything declared in a node_modules file is third-party library code.
+    if is_under_node_modules(path) {
+        for sym in symbols.iter_mut() {
+            sym.is_external = true;
         }
     }
 
@@ -884,13 +898,28 @@ fn walk_node(
             }
             scopes.pop();
         }
-        "assignment_expression" | "variable_declaration" | "lexical_declaration" => {
+        "assignment_expression" => {
             if let Some(left) = node.child_by_field_name("left") {
                 bind_locals(left, src.as_bytes(), scopes);
             }
             let mut c = node.walk();
             for child in node.named_children(&mut c) {
                 walk_node(child, src, enclosing, scopes, refs, env, env_hints);
+            }
+        }
+        "variable_declaration" | "lexical_declaration" => {
+            // Walk each declarator's initializer only. The declarator's own name is a
+            // binding site, not a use -- visiting it as a plain identifier would create
+            // a spurious "declaring this counts as using it" reference (e.g. every
+            // `const x = require(...)` would self-reference `x`, making unused imports
+            // and unused locals impossible to ever flag as dead).
+            let mut c = node.walk();
+            for declarator in node.named_children(&mut c) {
+                if declarator.kind() == "variable_declarator" {
+                    if let Some(value) = declarator.child_by_field_name("value") {
+                        walk_node(value, src, enclosing, scopes, refs, env, env_hints);
+                    }
+                }
             }
         }
         "call_expression" => {

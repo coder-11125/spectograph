@@ -127,6 +127,7 @@ fn symbol(id: SymbolId, name: &str, kind: SymbolKind, path: &Path, node: Node) -
         span: span(node),
         reachable: false,
         environment: Environment::Universal,
+        is_external: false,
     }
 }
 

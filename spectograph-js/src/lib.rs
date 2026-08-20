@@ -5,7 +5,7 @@
 pub mod entrypoints;
 pub mod parse;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use entrypoints::detect_entrypoint_symbols;
@@ -18,6 +18,151 @@ use spectograph_core::ir::{
 
 /// Analyzer for the JavaScript language.
 pub struct JavaScriptAnalyzer;
+
+/// A curated set of very common npm packages. Used to recognize bare import
+/// specifiers as legitimate external dependencies even when `node_modules` isn't
+/// present on disk (e.g. analyzing a repo before `npm install`), or when a package
+/// simply doesn't declare an entry point we can resolve.
+pub const KNOWN_NPM_PACKAGES: &[&str] = &[
+    "react",
+    "react-dom",
+    "react-router",
+    "react-router-dom",
+    "next",
+    "vue",
+    "svelte",
+    "lodash",
+    "underscore",
+    "ramda",
+    "moment",
+    "dayjs",
+    "date-fns",
+    "express",
+    "koa",
+    "fastify",
+    "hapi",
+    "@nestjs/core",
+    "axios",
+    "node-fetch",
+    "got",
+    "request",
+    "superagent",
+    "webpack",
+    "vite",
+    "rollup",
+    "esbuild",
+    "parcel",
+    "@babel/core",
+    "typescript",
+    "eslint",
+    "prettier",
+    "jest",
+    "vitest",
+    "mocha",
+    "chai",
+    "sinon",
+    "redux",
+    "@reduxjs/toolkit",
+    "mobx",
+    "rxjs",
+    "zustand",
+    "recoil",
+    "chalk",
+    "commander",
+    "yargs",
+    "dotenv",
+    "uuid",
+    "nanoid",
+    "classnames",
+    "prop-types",
+    "styled-components",
+    "tailwindcss",
+    "sass",
+    "less",
+    "socket.io",
+    "ws",
+    "graphql",
+    "apollo-server",
+    "@apollo/client",
+    "mongoose",
+    "sequelize",
+    "prisma",
+    "knex",
+    "pg",
+    "mysql",
+    "mysql2",
+    "sqlite3",
+    "jsonwebtoken",
+    "bcrypt",
+    "bcryptjs",
+    "passport",
+    "cors",
+    "helmet",
+    "morgan",
+    "body-parser",
+    "multer",
+    "joi",
+    "zod",
+    "yup",
+    "ajv",
+    "immutable",
+    "lru-cache",
+    "debug",
+    "semver",
+    "glob",
+    "fs-extra",
+    "chokidar",
+    "jquery",
+    "d3",
+    "three",
+    "chart.js",
+    "leaflet",
+];
+
+/// The package name a bare (non-relative, non-absolute) import specifier belongs to:
+/// `"lodash/debounce"` -> `"lodash"`, `"@scope/pkg/sub"` -> `"@scope/pkg"`,
+/// `"react"` -> `"react"`. A scoped package name is two `/`-separated segments;
+/// anything else is one.
+pub fn npm_package_root(specifier: &str) -> &str {
+    let segments_in_name = if specifier.starts_with('@') { 2 } else { 1 };
+    match specifier
+        .char_indices()
+        .filter(|(_, c)| *c == '/')
+        .nth(segments_in_name - 1)
+    {
+        Some((i, _)) => &specifier[..i],
+        None => specifier,
+    }
+}
+
+/// True if `specifier` (a bare, non-relative import specifier) is a recognized
+/// third-party package: either a well-known name, or declared in the project's
+/// package.json.
+pub fn is_recognized_npm_package(specifier: &str, declared_deps: &HashSet<String>) -> bool {
+    let root = npm_package_root(specifier);
+    KNOWN_NPM_PACKAGES.contains(&root) || declared_deps.contains(root)
+}
+
+/// Read all dependency names declared in the root package.json, across
+/// dependencies/devDependencies/peerDependencies/optionalDependencies.
+pub fn read_declared_dependencies(root: &Path) -> HashSet<String> {
+    let Some(json) = std::fs::read_to_string(root.join("package.json"))
+        .ok()
+        .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+    else {
+        return HashSet::new();
+    };
+    [
+        "dependencies",
+        "devDependencies",
+        "peerDependencies",
+        "optionalDependencies",
+    ]
+    .iter()
+    .filter_map(|key| json.get(*key).and_then(|v| v.as_object()))
+    .flat_map(|m| m.keys().cloned())
+    .collect()
+}
 
 /// Read the `browser` field of the project's root `package.json`, if it's an object map
 /// (bundlers use this to substitute browser-specific modules for Node ones, e.g.
@@ -51,6 +196,73 @@ fn normalize_path(path: &Path) -> PathBuf {
     result
 }
 
+/// Try `path` as-is, then `path.js`, then `path/index.js` (Node.js's extension and
+/// directory-index resolution rules), returning the first that exists as a file.
+fn resolve_file_candidate(path: &Path) -> Option<PathBuf> {
+    if path.is_file() {
+        return Some(path.to_path_buf());
+    }
+    if path.extension().is_none() {
+        let with_js = path.with_extension("js");
+        if with_js.is_file() {
+            return Some(with_js);
+        }
+    }
+    if path.is_dir() {
+        let index_path = path.join("index.js");
+        if index_path.is_file() {
+            return Some(index_path);
+        }
+    }
+    None
+}
+
+/// Pick an entry-point file from a package.json `exports` condition object
+/// (`{"require": ..., "import": ..., "default": ...}`), preferring `require` since
+/// this analyzer treats CommonJS and ESM specifiers uniformly.
+fn pick_export_condition(map: &serde_json::Map<String, Value>) -> Option<String> {
+    ["require", "node", "import", "default"]
+        .iter()
+        .find_map(|key| map.get(*key).and_then(|v| v.as_str()).map(String::from))
+}
+
+/// Resolve a package.json `exports` field to a single entry-point path, handling the
+/// common shapes: a bare string, `{".": "..."}`, `{".": {"require": ..., ...}}`, and a
+/// condition object with no `"."` key.
+fn exports_entry(exports: &Value) -> Option<String> {
+    match exports {
+        Value::String(s) => Some(s.clone()),
+        Value::Object(map) => match map.get(".") {
+            Some(Value::String(s)) => Some(s.clone()),
+            Some(Value::Object(cond)) => pick_export_condition(cond),
+            _ => pick_export_condition(map),
+        },
+        _ => None,
+    }
+}
+
+/// Resolve a package directory (one that has been found under `node_modules`) to its
+/// entry-point file, preferring the modern `exports` field over `main`, and falling
+/// back to `index.js` if neither resolves to a real file.
+fn resolve_package_entry(pkg_dir: &Path) -> Option<PathBuf> {
+    if let Ok(content) = std::fs::read_to_string(pkg_dir.join("package.json")) {
+        if let Ok(json) = serde_json::from_str::<Value>(&content) {
+            let entry = json
+                .get("exports")
+                .and_then(exports_entry)
+                .or_else(|| json.get("main").and_then(|m| m.as_str()).map(String::from));
+            if let Some(entry) = entry {
+                if let Some(resolved) =
+                    resolve_file_candidate(&normalize_path(&pkg_dir.join(&entry)))
+                {
+                    return Some(resolved);
+                }
+            }
+        }
+    }
+    resolve_file_candidate(&pkg_dir.join("index.js"))
+}
+
 /// Node.js-style module resolution helper, with optional bundler `browser`-field
 /// remapping. Returns the resolved file path plus the [`Environment`] the resolution
 /// implies (`Browser` only when a `browser` field remap was applied).
@@ -72,58 +284,30 @@ fn resolve_module_path(
     // Handle relative paths (starting with '.' or '..')
     if module_path.starts_with('.') {
         let path = normalize_path(&base.join(module_path));
-
-        // If the path doesn't have an extension, try .js
-        if path.extension().is_none() {
-            let with_js = path.with_extension("js");
-            if with_js.exists() {
-                return (with_js, Environment::Universal);
-            }
+        if let Some(resolved) = resolve_file_candidate(&path) {
+            return (resolved, Environment::Universal);
         }
-
-        // If path is a directory, try index.js
-        if path.is_dir() {
-            let index_path = path.join("index.js");
-            if index_path.exists() {
-                return (index_path, Environment::Universal);
-            }
-        }
-
         return (path, Environment::Universal);
     }
 
-    // Handle node_modules packages (non-relative imports)
-    // Walk up the directory tree looking for node_modules
+    // Handle node_modules packages (non-relative imports), including package
+    // sub-paths (`lodash/debounce`) and scoped packages (`@scope/pkg`).
+    // Walk up the directory tree looking for node_modules.
     let mut current = base;
     loop {
-        let node_modules = current.join("node_modules").join(module_path);
+        let candidate = current.join("node_modules").join(module_path);
 
-        // Try the package path
-        if node_modules.exists() {
-            if node_modules.is_dir() {
-                // Check for package.json main field
-                let package_json = node_modules.join("package.json");
-                if package_json.exists() {
-                    if let Ok(content) = std::fs::read_to_string(&package_json) {
-                        if let Ok(json) = serde_json::from_str::<Value>(&content) {
-                            if let Some(main) = json.get("main").and_then(|m| m.as_str()) {
-                                let main_path = normalize_path(&node_modules.join(main));
-                                if main_path.exists() {
-                                    return (main_path, Environment::Universal);
-                                }
-                            }
-                        }
-                    }
-                    // Fall back to index.js
-                    let index_path = node_modules.join("index.js");
-                    if index_path.exists() {
-                        return (index_path, Environment::Universal);
-                    }
+        if candidate.exists() {
+            if candidate.is_dir() {
+                if let Some(entry) = resolve_package_entry(&candidate) {
+                    return (entry, Environment::Universal);
                 }
             } else {
-                // It's a file, return it
-                return (node_modules, Environment::Universal);
+                return (candidate, Environment::Universal);
             }
+        } else if let Some(resolved) = resolve_file_candidate(&candidate) {
+            // A sub-path import without an extension, e.g. `require('pkg/sub')`.
+            return (resolved, Environment::Universal);
         }
 
         // Move up to parent directory
@@ -269,15 +453,26 @@ impl Analyzer for JavaScriptAnalyzer {
                             environment: ref_env,
                         });
                     } else if imp.is_default {
-                        // For CommonJS default imports, fall back to global def_index
-                        // This handles cases where module.exports = function() {} patterns
-                        if let Some(&def_id) = def_index.get(&imp.local_name) {
-                            program.references.push(Reference {
-                                from: imp.symbol_id,
-                                to: def_id,
-                                kind: RefKind::ReExport,
-                                environment: ref_env,
-                            });
+                        // For CommonJS default imports, fall back to the global def_index
+                        // (handles module.exports = function() {} patterns). Never do this
+                        // for a target resolved into third-party (node_modules) code: the
+                        // specific export name genuinely wasn't found there, and searching
+                        // the whole project for a same-named symbol risks wrongly linking
+                        // an external package's import to an unrelated local definition.
+                        let target_is_external = program
+                            .symbols
+                            .get(target_module_id)
+                            .map(|s| s.is_external)
+                            .unwrap_or(false);
+                        if !target_is_external {
+                            if let Some(&def_id) = def_index.get(&imp.local_name) {
+                                program.references.push(Reference {
+                                    from: imp.symbol_id,
+                                    to: def_id,
+                                    kind: RefKind::ReExport,
+                                    environment: ref_env,
+                                });
+                            }
                         }
                     }
                 } else {
