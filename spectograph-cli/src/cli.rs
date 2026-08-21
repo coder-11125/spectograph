@@ -37,8 +37,9 @@ pub struct CheckArgs {
     #[arg(long, default_value = "guaranteed")]
     pub fail_on: String,
 
-    /// Reference-resolution backend: static (default) or pyright (type-aware).
-    #[arg(long, default_value = "static", value_parser = ["static", "pyright"])]
+    /// Reference-resolution backend: static (default), pyright (type-aware
+    /// Python), or tsserver (type-aware TypeScript).
+    #[arg(long, default_value = "static", value_parser = ["static", "pyright", "tsserver"])]
     pub resolution: String,
 
     /// Path to the basedpyright executable (used with --resolution pyright).
@@ -49,6 +50,15 @@ pub struct CheckArgs {
     /// Timeout (ms) for the pyright LSP analysis when using --resolution pyright.
     #[arg(long, default_value = "15000")]
     pub pyright_timeout: u64,
+
+    /// Path to the typescript-language-server executable (used with
+    /// --resolution tsserver). Defaults to `typescript-language-server` on PATH.
+    #[arg(long)]
+    pub tsserver_executable: Option<String>,
+
+    /// Timeout (ms) for the tsserver LSP analysis when using --resolution tsserver.
+    #[arg(long, default_value = "15000")]
+    pub tsserver_timeout: u64,
 }
 
 #[derive(Args, Debug)]

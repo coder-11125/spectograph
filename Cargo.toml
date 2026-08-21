@@ -6,14 +6,15 @@ members = [
     "spectograph-cli",
     "spectograph-py",
     "spectograph-js",
+    "spectograph-ts",
 ]
 
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.97"
-license = "MIT OR Apache-2.0"
-repository = "https://github.com/1jehuang/spectograph"
+license = "MIT"
+repository = "https://github.com/coder-11125/spectograph"
 authors = ["spectograph contributors"]
 
 [workspace.dependencies]
@@ -21,6 +22,7 @@ spectograph-core = { path = "spectograph-core", version = "0.1.0" }
 spectograph-analyzer = { path = "spectograph-analyzer", version = "0.1.0" }
 spectograph-py = { path = "spectograph-py", version = "0.1.0" }
 spectograph-js = { path = "spectograph-js", version = "0.1.0" }
+spectograph-ts = { path = "spectograph-ts", version = "0.1.0" }
 
 # IR / graph
 serde = { version = "1", features = ["derive"] }

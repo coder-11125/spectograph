@@ -7,7 +7,9 @@ use spectograph_core::analysis::{self, BloatTier};
 use spectograph_core::cost::CostSource;
 use spectograph_core::ir::Language;
 use spectograph_core::report::{self, JsonReport};
+use spectograph_js::JavaScriptAnalyzer;
 use spectograph_py::PythonAnalyzer;
+use spectograph_ts::TypeScriptAnalyzer;
 
 use crate::cli::{Cli, Command, FixArgs};
 
@@ -15,8 +17,10 @@ use crate::cli::{Cli, Command, FixArgs};
 fn analyzer_for(lang: &str) -> Result<Box<dyn Analyzer>, String> {
     match lang {
         "python" | "py" => Ok(Box::new(PythonAnalyzer)),
+        "javascript" | "js" => Ok(Box::new(JavaScriptAnalyzer)),
+        "typescript" | "ts" => Ok(Box::new(TypeScriptAnalyzer)),
         other => Err(format!(
-            "unsupported language '{other}'. Implemented: python"
+            "unsupported language '{other}'. Implemented: python, javascript, typescript"
         )),
     }
 }
@@ -56,6 +60,7 @@ fn tier_from_str(s: &str) -> Result<BloatTier, String> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_check(
     root: &Path,
     format: &str,
@@ -64,6 +69,8 @@ fn run_check(
     resolution: &str,
     pyright_executable: Option<&str>,
     pyright_timeout: u64,
+    tsserver_executable: Option<&str>,
+    tsserver_timeout: u64,
 ) -> Result<i32, String> {
     let lang = match language {
         Some(l) => l.to_string(),
@@ -84,9 +91,24 @@ fn run_check(
             pyright_timeout,
         )
         .map_err(|e| format!("analysis failed: {e}"))?
+    } else if lang.starts_with("typescript") && resolution == "tsserver" {
+        // Type-aware resolution via typescript-language-server.
+        let ts = TypeScriptAnalyzer;
+        ts.analyze_with_resolution(
+            root,
+            spectograph_ts::ResolutionMode::Tsserver,
+            tsserver_executable,
+            tsserver_timeout,
+        )
+        .map_err(|e| format!("analysis failed: {e}"))?
     } else {
         if resolution == "pyright" {
             return Err("--resolution pyright is only supported for python currently".to_string());
+        }
+        if resolution == "tsserver" {
+            return Err(
+                "--resolution tsserver is only supported for typescript currently".to_string(),
+            );
         }
         analyzer
             .analyze(root)
@@ -137,6 +159,8 @@ pub fn run(cli: Cli) -> Result<std::process::ExitCode, String> {
             &args.resolution,
             args.pyright_executable.as_deref(),
             args.pyright_timeout,
+            args.tsserver_executable.as_deref(),
+            args.tsserver_timeout,
         )?,
         Command::Fix(args) => run_fix(args)?,
     };
