@@ -223,6 +223,7 @@ pub fn parse_file(path: &Path, src: &str, module_id: SymbolId, next_id: &mut usi
     );
     let mut env_hints: HashMap<SymbolId, Environment> = HashMap::new();
     collect_refs(root, src, module_id, &mut scopes, &mut refs, &mut env_hints);
+    refs.extend(collect_react_lifecycle_edges(root, src, &symbols));
 
     // Symbols that bare-reference an environment-only global (outside any explicit
     // guard) inherit that signal too, so e.g. a function touching `window.foo`
@@ -266,6 +267,90 @@ fn contains_jsx(node: Node) -> bool {
     found
 }
 
+/// Unwrap `forwardRef(...)`/`memo(...)` (bare or namespaced, e.g.
+/// `React.memo`) down to the function/arrow-function component definition
+/// inside -- or `value` itself, if it's already a bare function. These
+/// wrap a component without changing what it *is*: `memo(forwardRef(...))`
+/// is a common real combination, so this recurses to unwrap both layers.
+/// Returns `None` for anything else (a plain non-component value).
+fn unwrap_component_wrapper<'a>(value: Node<'a>, src: &[u8]) -> Option<Node<'a>> {
+    match value.kind() {
+        "arrow_function" | "function_expression" => Some(value),
+        "call_expression" => {
+            let func = value.child_by_field_name("function")?;
+            let tail = match func.kind() {
+                "identifier" => func,
+                "member_expression" => func.child_by_field_name("property")?,
+                _ => return None,
+            };
+            if !matches!(node_text(tail, src), "forwardRef" | "memo") {
+                return None;
+            }
+            let args = value.child_by_field_name("arguments")?;
+            unwrap_component_wrapper(args.named_child(0)?, src)
+        }
+        _ => None,
+    }
+}
+
+/// React lifecycle methods React itself invokes on a class component instance
+/// through its own reconciler -- never through a call written in the analyzed
+/// codebase. See the `class_declaration` arm of `walk_node`, which uses this
+/// to add an explicit reachability edge for each one a class component
+/// defines (mirroring the TS analyzer's Angular DI edges: same "framework
+/// calls this via reflection, not our code" problem).
+const REACT_LIFECYCLE_METHODS: &[&str] = &[
+    "render",
+    "componentDidMount",
+    "componentDidUpdate",
+    "componentWillUnmount",
+    "shouldComponentUpdate",
+    "getSnapshotBeforeUpdate",
+    "componentDidCatch",
+    "getDerivedStateFromProps",
+    "UNSAFE_componentWillMount",
+    "UNSAFE_componentWillReceiveProps",
+    "UNSAFE_componentWillUpdate",
+];
+
+/// True if `class_node`'s heritage clause extends `Component`/`PureComponent`,
+/// bare or namespaced (`React.Component`, `Preact.PureComponent`, ...).
+/// Matches on the trailing identifier only, since the namespace varies with
+/// how React (or a compatible library, e.g. Preact) was imported. `extends`
+/// itself is `class_heritage`'s one positional child -- not a named field on
+/// `class_declaration` -- confirmed via this grammar's node-types.json.
+fn extends_react_component(class_node: Node, src: &[u8]) -> bool {
+    let mut c = class_node.walk();
+    let Some(heritage) = class_node
+        .named_children(&mut c)
+        .find(|n| n.kind() == "class_heritage")
+    else {
+        return false;
+    };
+    let Some(expr) = heritage.named_child(0) else {
+        return false;
+    };
+    let tail = match expr.kind() {
+        "identifier" => expr,
+        "member_expression" => expr.child_by_field_name("property").unwrap_or(expr),
+        _ => return false,
+    };
+    matches!(node_text(tail, src), "Component" | "PureComponent")
+}
+
+/// Find `class_node`'s `render()` method body, if it has one.
+fn class_render_body<'a>(class_node: Node<'a>, src: &[u8]) -> Option<Node<'a>> {
+    let body = class_node.child_by_field_name("body")?;
+    let mut c = body.walk();
+    let render = body.named_children(&mut c).find(|m| {
+        m.kind() == "method_definition"
+            && m.child_by_field_name("name")
+                .map(|n| node_text(n, src) == "render")
+                .unwrap_or(false)
+    })?;
+    render.child_by_field_name("body")
+}
+
 /// Extract prop names destructured from a component's first parameter
 /// (`{ label, onClick, disabled = false }`). Returns empty if the parameter isn't
 /// a destructuring pattern (e.g. a bare `props`), since we then can't statically
@@ -302,6 +387,74 @@ fn destructured_prop_names(params: Node, src: &[u8]) -> Vec<String> {
         }
     }
     names
+}
+
+/// Add a reachability edge from a class component to each React lifecycle
+/// method it defines (see [`REACT_LIFECYCLE_METHODS`]).
+///
+/// A separate pass over the raw AST, like [`detect_react`], rather than
+/// threaded through [`walk_node`]/[`Scopes`]: doing it there would mean
+/// resolving each method by its bare name through the same flat, file-wide
+/// scope table [`collect_globals`] declares all class methods into, which is
+/// ambiguous the moment two classes in the file share a lifecycle method name
+/// (e.g. two components both defining `render`) -- last declaration wins,
+/// silently wiring the edge to the wrong class's method. Resolving by the
+/// method's exact `"ClassName.methodName"` symbol name instead sidesteps that
+/// entirely, since dotted names are always unique.
+fn collect_react_lifecycle_edges(root: Node, src: &str, symbols: &[Symbol]) -> Vec<UnresolvedRef> {
+    let mut by_full_name: HashMap<&str, SymbolId> = HashMap::new();
+    for s in symbols {
+        by_full_name.entry(s.name.as_str()).or_insert(s.id);
+    }
+    let mut edges = Vec::new();
+    walk_for_class_components(root, src, &by_full_name, &mut edges);
+    edges
+}
+
+fn walk_for_class_components(
+    node: Node,
+    src: &str,
+    by_full_name: &HashMap<&str, SymbolId>,
+    edges: &mut Vec<UnresolvedRef>,
+) {
+    if node.kind() == "class_declaration" {
+        if let Some(name_node) = node.child_by_field_name("name") {
+            let class_name = node_text(name_node, src.as_bytes());
+            if extends_react_component(node, src.as_bytes()) {
+                if let (Some(&class_id), Some(body)) = (
+                    by_full_name.get(class_name),
+                    node.child_by_field_name("body"),
+                ) {
+                    let mut c = body.walk();
+                    for method in body.named_children(&mut c) {
+                        if method.kind() != "method_definition" {
+                            continue;
+                        }
+                        let Some(method_name_node) = method.child_by_field_name("name") else {
+                            continue;
+                        };
+                        let method_name = node_text(method_name_node, src.as_bytes());
+                        if !REACT_LIFECYCLE_METHODS.contains(&method_name) {
+                            continue;
+                        }
+                        let full_name = format!("{class_name}.{method_name}");
+                        if let Some(&method_id) = by_full_name.get(full_name.as_str()) {
+                            edges.push(UnresolvedRef {
+                                from: class_id,
+                                target: RefTarget::Symbol(method_id),
+                                kind: RefKind::Static,
+                                environment: Environment::Universal,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let mut c = node.walk();
+    for child in node.named_children(&mut c) {
+        walk_for_class_components(child, src, by_full_name, edges);
+    }
 }
 
 /// Detect React components, JSX usage sites, and hook calls in one file.
@@ -362,6 +515,33 @@ fn detect_react(
                     }
                 }
             }
+            "class_declaration" => {
+                if let Some(name_node) = decl.child_by_field_name("name") {
+                    let name = node_text(name_node, src.as_bytes()).to_string();
+                    if is_component_name(&name) && extends_react_component(decl, src.as_bytes()) {
+                        let has_jsx = class_render_body(decl, src.as_bytes())
+                            .map(contains_jsx)
+                            .unwrap_or(false);
+                        if has_jsx {
+                            if let Some(&id) = name_to_id.get(&name) {
+                                // Props aren't statically enumerable for class
+                                // components the way a destructured parameter
+                                // is -- they're read off `this.props.x` inside
+                                // the class body, which would need deeper flow
+                                // analysis. Same "can't enumerate" case as a
+                                // function component taking a bare `props`.
+                                components.push(ReactComponent {
+                                    symbol_id: id,
+                                    name,
+                                    file: path.to_path_buf(),
+                                    line: span(decl).start_line,
+                                    declared_props: Vec::new(),
+                                });
+                            }
+                        }
+                    }
+                }
+            }
             "lexical_declaration" | "variable_declaration" => {
                 let mut dc = decl.walk();
                 for d in decl.named_children(&mut dc) {
@@ -374,17 +554,17 @@ fn detect_react(
                     ) else {
                         continue;
                     };
-                    if !matches!(value.kind(), "arrow_function" | "function_expression") {
+                    let Some(func) = unwrap_component_wrapper(value, src.as_bytes()) else {
                         continue;
-                    }
+                    };
                     let name = node_text(name_node, src.as_bytes()).to_string();
-                    let body_has_jsx = value
+                    let body_has_jsx = func
                         .child_by_field_name("body")
                         .map(contains_jsx)
                         .unwrap_or(false);
                     if is_component_name(&name) && body_has_jsx {
                         if let Some(&id) = name_to_id.get(&name) {
-                            let declared_props = value
+                            let declared_props = func
                                 .child_by_field_name("parameters")
                                 .map(|p| destructured_prop_names(p, src.as_bytes()))
                                 .unwrap_or_default();
@@ -434,14 +614,14 @@ fn scan_jsx_and_hooks(
     match node.kind() {
         "variable_declarator" => {
             if let Some(value) = node.child_by_field_name("value") {
-                if matches!(value.kind(), "arrow_function" | "function_expression") {
+                if let Some(func) = unwrap_component_wrapper(value, src.as_bytes()) {
                     let new_enclosing = node
                         .child_by_field_name("name")
                         .map(|n| node_text(n, src.as_bytes()).to_string())
                         .and_then(|name| name_to_id.get(&name).copied())
                         .unwrap_or(enclosing);
                     scan_jsx_and_hooks(
-                        value,
+                        func,
                         path,
                         src,
                         name_to_id,
@@ -473,9 +653,44 @@ fn scan_jsx_and_hooks(
             }
             return;
         }
+        "class_declaration" => {
+            // Everything in a class component's body -- `render()`, any other
+            // method -- is attributed to the class itself (its own
+            // `ReactComponent`, if it has one), not to the individual method:
+            // there's no separate per-method component to attach to, unlike a
+            // top-level function/arrow component. A method's bare name (e.g.
+            // "render") isn't registered in `name_to_id` under that bare form
+            // (class methods are named "ClassName.method" there), so the
+            // nested "method_definition" arm's own lookup will miss and fall
+            // back to whatever `enclosing` we set here -- composes correctly
+            // without needing a special case there.
+            let new_enclosing = node
+                .child_by_field_name("name")
+                .map(|n| node_text(n, src.as_bytes()).to_string())
+                .and_then(|name| name_to_id.get(&name).copied())
+                .unwrap_or(enclosing);
+            let mut c = node.walk();
+            for child in node.named_children(&mut c) {
+                scan_jsx_and_hooks(
+                    child,
+                    path,
+                    src,
+                    name_to_id,
+                    new_enclosing,
+                    jsx_usages,
+                    hook_calls,
+                );
+            }
+            return;
+        }
         "jsx_opening_element" | "jsx_self_closing_element" => {
             if let Some(name_node) = node.child_by_field_name("name") {
-                if name_node.kind() == "identifier" {
+                // A namespaced tag (`<Menu.Item/>`, `<Nav.Menu.Item/>`) parses
+                // its name as a `member_expression`, not a plain `identifier`
+                // -- `node_text` on it yields the exact dotted source text
+                // ("Menu.Item"), which is already what we want, so no
+                // separate reconstruction is needed.
+                if matches!(name_node.kind(), "identifier" | "member_expression") {
                     let name = node_text(name_node, src.as_bytes()).to_string();
                     if is_component_name(&name) {
                         let mut passed_props = Vec::new();

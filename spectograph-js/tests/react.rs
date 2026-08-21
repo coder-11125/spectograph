@@ -3,6 +3,9 @@
 
 use tempfile::tempdir;
 
+use spectograph_analyzer::Analyzer;
+use spectograph_core::analysis;
+use spectograph_core::cost::{CostModel, CostSource};
 use spectograph_js::react::{is_component_name, is_hook_name};
 use spectograph_js::JavaScriptAnalyzer;
 
@@ -16,6 +19,21 @@ fn analyze_react(
         std::fs::write(&path, content).unwrap();
     }
     JavaScriptAnalyzer.analyze_react(dir.path()).unwrap()
+}
+
+fn analyze_js(files: &[(&str, &str)]) -> spectograph_core::ir::Program {
+    let dir = tempdir().unwrap();
+    for (name, content) in files {
+        let path = dir.path().join(name);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, content).unwrap();
+    }
+    JavaScriptAnalyzer.analyze(dir.path()).unwrap()
+}
+
+fn bloat_findings(program: &mut spectograph_core::ir::Program) -> Vec<analysis::BloatFinding> {
+    let model = CostModel::build(program, CostSource::Estimated);
+    analysis::analyze(program, &model).findings
 }
 
 // --- naming heuristics --------------------------------------------------------
@@ -310,5 +328,353 @@ function App() {
         mismatches.is_empty(),
         "a component taking a bare `props` object can't be statically checked, so it must not produce false positives: {:?}",
         mismatches
+    );
+}
+
+// --- Class components -----------------------------------------------------------
+
+#[test]
+fn class_extending_react_component_is_detected() {
+    let (_program, react) = analyze_react(&[(
+        "App.jsx",
+        "class App extends React.Component {\n    render() {\n        return <div>hi</div>;\n    }\n}\n",
+    )]);
+    assert!(
+        react.components.iter().any(|c| c.name == "App"),
+        "a class extending React.Component with a JSX-returning render() should be detected"
+    );
+}
+
+#[test]
+fn class_extending_bare_component_import_is_detected() {
+    // `import { Component } from 'react'; class App extends Component` -- the
+    // namespace varies with how React was imported, so detection matches on
+    // the trailing identifier only.
+    let (_program, react) = analyze_react(&[(
+        "App.jsx",
+        "class App extends Component {\n    render() {\n        return <div>hi</div>;\n    }\n}\n",
+    )]);
+    assert!(react.components.iter().any(|c| c.name == "App"));
+}
+
+#[test]
+fn class_extending_pure_component_is_detected() {
+    let (_program, react) = analyze_react(&[(
+        "App.jsx",
+        "class App extends React.PureComponent {\n    render() {\n        return <div>hi</div>;\n    }\n}\n",
+    )]);
+    assert!(react.components.iter().any(|c| c.name == "App"));
+}
+
+#[test]
+fn class_component_without_render_is_not_a_component() {
+    let (_program, react) = analyze_react(&[(
+        "App.jsx",
+        "class App extends React.Component {\n    helper() {\n        return 1;\n    }\n}\n",
+    )]);
+    assert!(
+        !react.components.iter().any(|c| c.name == "App"),
+        "no render() at all means nothing to detect it by"
+    );
+}
+
+#[test]
+fn class_not_extending_component_is_not_a_component() {
+    let (_program, react) = analyze_react(&[(
+        "App.jsx",
+        "class App {\n    render() {\n        return <div>hi</div>;\n    }\n}\n",
+    )]);
+    assert!(
+        !react.components.iter().any(|c| c.name == "App"),
+        "a render() method alone isn't enough -- it must extend Component/PureComponent"
+    );
+}
+
+#[test]
+fn class_component_declared_props_are_empty() {
+    // Unlike a function component's destructured parameter, a class
+    // component's props are read off `this.props.x`, which we don't do flow
+    // analysis on -- same "can't enumerate" case as a bare `props` parameter.
+    let (_program, react) = analyze_react(&[(
+        "App.jsx",
+        "class App extends React.Component {\n    render() {\n        return <div>{this.props.title}</div>;\n    }\n}\n",
+    )]);
+    let app = react.components.iter().find(|c| c.name == "App").unwrap();
+    assert!(app.declared_props.is_empty());
+}
+
+#[test]
+fn jsx_inside_class_render_method_is_captured_as_usage() {
+    let (_program, react) = analyze_react(&[(
+        "App.jsx",
+        r#"function Child() { return <span/>; }
+class App extends React.Component {
+    render() {
+        return <div><Child/></div>;
+    }
+}
+"#,
+    )]);
+    assert!(
+        react.jsx_usages.iter().any(|u| u.component_name == "Child"),
+        "JSX rendered from inside a class component's render() should still be captured"
+    );
+}
+
+#[test]
+fn class_component_lifecycle_methods_are_not_falsely_flagged_as_bloat() {
+    // Without an explicit edge, `render()` (and anything it renders) always
+    // looks unreachable and gets flagged as guaranteed bloat, since React
+    // calls it through its own reconciler -- never through code in the
+    // analyzed codebase. Same category of problem as Angular DI's
+    // constructor injection in the TS analyzer.
+    let mut program = analyze_js(&[
+        (
+            "App.jsx",
+            r#"import Child from './Child';
+
+class App extends React.Component {
+    render() {
+        return <div><Child/></div>;
+    }
+    componentDidMount() {
+        console.log('mounted');
+    }
+}
+
+export default App;
+"#,
+        ),
+        (
+            "Child.jsx",
+            "function Child() { return <span/>; }\nexport default Child;\n",
+        ),
+    ]);
+    let findings = bloat_findings(&mut program);
+    let flagged: Vec<&str> = findings.iter().map(|f| f.name.as_str()).collect();
+    assert!(
+        !flagged.contains(&"App.render"),
+        "render() is always called by React and must not be flagged: {:?}",
+        flagged
+    );
+    assert!(
+        !flagged.contains(&"App.componentDidMount"),
+        "componentDidMount() is a React lifecycle hook and must not be flagged: {:?}",
+        flagged
+    );
+    assert!(
+        !flagged.contains(&"Child"),
+        "Child is rendered from App's render() and must not be flagged: {:?}",
+        flagged
+    );
+}
+
+#[test]
+fn class_component_non_lifecycle_method_is_still_flagged_when_unused() {
+    // The lifecycle-edge protection must be specific to React's own
+    // lifecycle names -- an ordinary unused helper method on the same class
+    // should still be caught.
+    let mut program = analyze_js(&[(
+        "App.jsx",
+        r#"class App extends React.Component {
+    render() {
+        return <div>hi</div>;
+    }
+    unusedHelper() {
+        return 1;
+    }
+}
+
+export default App;
+"#,
+    )]);
+    let findings = bloat_findings(&mut program);
+    assert!(
+        findings.iter().any(|f| f.name == "App.unusedHelper"),
+        "a non-lifecycle method that's genuinely unused should still be flagged: {:?}",
+        findings.iter().map(|f| &f.name).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn non_component_class_lifecycle_named_method_is_not_protected() {
+    // A plain class (doesn't extend Component/PureComponent) that happens to
+    // have a method named `render` is not a React component -- that method
+    // must not get the reachability exemption.
+    let mut program = analyze_js(&[(
+        "App.jsx",
+        "class NotAComponent {\n    render() {\n        return 1;\n    }\n}\n\nexport default NotAComponent;\n",
+    )]);
+    let findings = bloat_findings(&mut program);
+    assert!(
+        findings.iter().any(|f| f.name == "NotAComponent.render"),
+        "render() on a non-Component class is an ordinary method and should be flagged if unused: {:?}",
+        findings.iter().map(|f| &f.name).collect::<Vec<_>>()
+    );
+}
+
+// --- forwardRef / memo -wrapped components --------------------------------------
+
+#[test]
+fn bare_forward_ref_component_is_detected() {
+    let (_program, react) = analyze_react(&[(
+        "Input.jsx",
+        "const Input = forwardRef((props, ref) => {\n    return <input ref={ref} value={props.value} />;\n});\n",
+    )]);
+    assert!(
+        react.components.iter().any(|c| c.name == "Input"),
+        "forwardRef((props, ref) => ...) should be detected as a component"
+    );
+}
+
+#[test]
+fn namespaced_memo_component_is_detected() {
+    let (_program, react) = analyze_react(&[(
+        "Badge.jsx",
+        "const Badge = React.memo(({ count }) => <span>{count}</span>);\n",
+    )]);
+    let badge = react.components.iter().find(|c| c.name == "Badge").unwrap();
+    assert_eq!(badge.declared_props, vec!["count".to_string()]);
+}
+
+#[test]
+fn nested_memo_forward_ref_component_is_detected() {
+    // memo(forwardRef(...)) is a common real combination.
+    let (_program, react) = analyze_react(&[(
+        "Button.jsx",
+        "const Button = memo(forwardRef(function Button(props, ref) {\n    return <button ref={ref}>{props.label}</button>;\n}));\n",
+    )]);
+    assert!(react.components.iter().any(|c| c.name == "Button"));
+}
+
+#[test]
+fn forward_ref_first_param_is_still_props_not_ref() {
+    let (_program, react) = analyze_react(&[(
+        "Input.jsx",
+        "const Input = forwardRef(({ value, onChange }, ref) => {\n    return <input ref={ref} value={value} onChange={onChange} />;\n});\n",
+    )]);
+    let input = react.components.iter().find(|c| c.name == "Input").unwrap();
+    let mut props = input.declared_props.clone();
+    props.sort();
+    assert_eq!(props, vec!["onChange", "value"]);
+}
+
+#[test]
+fn wrapper_call_to_unrelated_function_is_not_a_component() {
+    // A random call wrapping an arrow function that ISN'T forwardRef/memo
+    // must not be treated as a component wrapper.
+    let (_program, react) = analyze_react(&[(
+        "helpers.jsx",
+        "const Wrapped = debounce(() => {\n    return <div/>;\n});\n",
+    )]);
+    assert!(!react.components.iter().any(|c| c.name == "Wrapped"));
+}
+
+#[test]
+fn hook_calls_inside_forward_ref_component_are_attributed_correctly() {
+    let (program, react) = analyze_react(&[(
+        "Input.jsx",
+        r#"import { useState } from 'react';
+
+const Input = forwardRef((props, ref) => {
+    const [value, setValue] = useState('');
+    return <input ref={ref} value={value} />;
+});
+"#,
+    )]);
+    let input_id = program
+        .symbols
+        .iter()
+        .find(|s| s.name == "Input")
+        .unwrap()
+        .id;
+    assert!(react
+        .hook_calls
+        .iter()
+        .any(|h| h.enclosing == input_id && h.hook_name == "useState"));
+}
+
+#[test]
+fn jsx_usage_of_forward_ref_component_is_captured() {
+    let (_program, react) = analyze_react(&[(
+        "App.jsx",
+        r#"const Input = forwardRef((props, ref) => <input ref={ref} />);
+function App() {
+    return <Input placeholder="hi" />;
+}
+"#,
+    )]);
+    assert!(react.jsx_usages.iter().any(|u| u.component_name == "Input"));
+}
+
+// --- Fragments and namespaced JSX tags ------------------------------------------
+
+#[test]
+fn component_returning_a_bare_fragment_is_still_detected() {
+    // `<>...</>` parses as a plain `jsx_element` with an unnamed opening/
+    // closing tag in this grammar -- there's no separate `jsx_fragment` node
+    // kind, so `contains_jsx`'s existing `jsx_element` check already covers
+    // it. Locking that in with a regression test.
+    let (_program, react) = analyze_react(&[(
+        "App.jsx",
+        "function App({ children }) {\n    return <>{children}</>;\n}\n",
+    )]);
+    assert!(react.components.iter().any(|c| c.name == "App"));
+}
+
+#[test]
+fn namespaced_jsx_tag_usage_is_captured() {
+    let (_program, react) = analyze_react(&[(
+        "App.jsx",
+        r#"function App() {
+    return <Menu.Item label="hi" />;
+}
+"#,
+    )]);
+    let usage = react
+        .jsx_usages
+        .iter()
+        .find(|u| u.component_name == "Menu.Item")
+        .expect("Menu.Item usage should be captured");
+    assert_eq!(usage.passed_props, vec!["label".to_string()]);
+}
+
+#[test]
+fn deeply_namespaced_jsx_tag_usage_is_captured() {
+    let (_program, react) = analyze_react(&[(
+        "App.jsx",
+        "function App() {\n    return <Nav.Menu.Item/>;\n}\n",
+    )]);
+    assert!(react
+        .jsx_usages
+        .iter()
+        .any(|u| u.component_name == "Nav.Menu.Item"));
+}
+
+#[test]
+fn namespaced_and_intrinsic_tags_mixed_are_distinguished_correctly() {
+    let (_program, react) = analyze_react(&[(
+        "App.jsx",
+        r#"function App() {
+    return (
+        <Nav.Menu.Item foo="x">
+            <Nav.Item bar="y" />
+            <div className="plain" />
+        </Nav.Menu.Item>
+    );
+}
+"#,
+    )]);
+    let names: Vec<&str> = react
+        .jsx_usages
+        .iter()
+        .map(|u| u.component_name.as_str())
+        .collect();
+    assert!(names.contains(&"Nav.Menu.Item"));
+    assert!(names.contains(&"Nav.Item"));
+    assert!(
+        !names.contains(&"div"),
+        "the lowercase intrinsic tag must still be excluded: {:?}",
+        names
     );
 }
