@@ -7,8 +7,17 @@
 //! `obj.method()` resolves by `obj`'s real type rather than by name, and
 //! generic/overloaded call sites resolve correctly.
 //!
+//! Lives in its own crate (rather than in `spectograph-ts`, alongside
+//! `spectograph-py`'s `pyright.rs`) because the same server and client drive
+//! both TypeScript *and* plain JavaScript (`allowJs`/`checkJs`):
+//! `spectograph-js` can't depend on `spectograph-ts` (which already depends
+//! on `spectograph-js` for its React support) without a cycle, and this isn't
+//! generic enough to belong in `spectograph-analyzer` -- it's JS/TS-ecosystem
+//! specific (npm, node's `tsserver.js`), not something a Python or Go
+//! analyzer would ever call.
+//!
 //! If the server is unavailable (not installed, spawn failure, timeout),
-//! callers should fall back to the static resolver in [`crate::parse`].
+//! callers should fall back to each language's static resolver.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
@@ -22,6 +31,8 @@ use lsp_types::{
     PartialResultParams, Position, ReferenceContext, ReferenceParams, TextDocumentIdentifier,
     TextDocumentItem, Uri, WorkDoneProgressParams,
 };
+
+use spectograph_core::ir::Language;
 
 /// Errors from the tsserver LSP integration. Callers treat these as "fall back
 /// to the static resolver."
@@ -240,13 +251,17 @@ fn uri_to_path(uri: &str) -> PathBuf {
     }
 }
 
-/// LSP `languageId` for a source file, based on its extension. `.tsx` needs
-/// `typescriptreact` specifically -- `typescript-language-server` uses this to
-/// pick the JSX-aware grammar, same as our own TSX-vs-TS dialect switch in
-/// [`crate::parse::parse_file`].
+/// LSP `languageId` for a source file, based on its extension. `typescript-language-server`
+/// uses this both to pick the right grammar (JSX-aware `*react` dialects for
+/// `.tsx`/`.jsx`) and, for `.js`/`.jsx`, to run its JavaScript (as opposed to
+/// TypeScript) language service -- which still gets type-aware resolution via
+/// `allowJs`/`checkJs` and inferred/JSDoc types, just without a `.ts` file's
+/// explicit annotations.
 fn language_id_for(path: &Path) -> &'static str {
     match path.extension().and_then(|e| e.to_str()) {
         Some("tsx") => "typescriptreact",
+        Some("jsx") => "javascriptreact",
+        Some("js" | "mjs" | "cjs") => "javascript",
         _ => "typescript",
     }
 }
@@ -278,7 +293,9 @@ fn enclosing_symbol(spans: &[SymbolSpan], file: &Path, line: usize) -> Option<us
 /// as `initializationOptions.tsserver.path`. Without this, the server falls
 /// back to a non-functional stub ("bundled" version) that can't type-check
 /// anything and every query silently returns no results -- so this is
-/// required, not an optimization.
+/// required, not an optimization. Needed for plain JavaScript projects too:
+/// `typescript-language-server` always runs on top of a real `tsserver`, even
+/// when every opened file is `.js`.
 ///
 /// Tries `node_modules/typescript/lib/tsserver.js`, walking up from `root`
 /// the same way Node module resolution would, then falls back to a globally
@@ -477,23 +494,24 @@ fn drive_session(
     Ok(edges)
 }
 
-/// High-level orchestration: given a statically-built [`spectograph_core::ir::Program`],
-/// query `typescript-language-server` for the type-aware reference edges between
-/// its function/class/const symbols.
+/// High-level orchestration: given a statically-built [`spectograph_core::ir::Program`]
+/// for `language` (currently `TypeScript` or `JavaScript`), query
+/// `typescript-language-server` for the type-aware reference edges between its
+/// function/class/const symbols.
 ///
 /// Returns `(from, to)` symbol-id pairs. Meant to be called after the static
 /// analysis so the symbol table (with definitions and spans) already exists.
 pub fn resolve_program_edges(
     root: &Path,
     program: &spectograph_core::ir::Program,
+    language: Language,
     executable: &str,
     timeout_ms: u64,
 ) -> Result<Vec<(usize, usize)>, TsServerError> {
-    use spectograph_core::ir::{Language, SymbolKind};
+    use spectograph_core::ir::SymbolKind;
 
-    let files: Vec<PathBuf> =
-        spectograph_analyzer::discover::discover_files(root, Language::TypeScript)
-            .map_err(|e| TsServerError::Lsp(format!("discover {root:?}: {e}")))?;
+    let files: Vec<PathBuf> = spectograph_analyzer::discover::discover_files(root, language)
+        .map_err(|e| TsServerError::Lsp(format!("discover {root:?}: {e}")))?;
     let abs_of = |p: &Path| -> PathBuf {
         if p.is_absolute() {
             p.to_path_buf()
@@ -594,10 +612,14 @@ mod tests {
     }
 
     #[test]
-    fn language_id_distinguishes_tsx() {
+    fn language_id_distinguishes_ts_tsx_js_jsx() {
         assert_eq!(language_id_for(Path::new("App.tsx")), "typescriptreact");
         assert_eq!(language_id_for(Path::new("index.ts")), "typescript");
         assert_eq!(language_id_for(Path::new("types.d.ts")), "typescript");
+        assert_eq!(language_id_for(Path::new("App.jsx")), "javascriptreact");
+        assert_eq!(language_id_for(Path::new("index.js")), "javascript");
+        assert_eq!(language_id_for(Path::new("index.mjs")), "javascript");
+        assert_eq!(language_id_for(Path::new("index.cjs")), "javascript");
     }
 
     #[test]

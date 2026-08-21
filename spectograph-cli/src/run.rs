@@ -101,13 +101,24 @@ fn run_check(
             tsserver_timeout,
         )
         .map_err(|e| format!("analysis failed: {e}"))?
+    } else if lang.starts_with("javascript") && resolution == "tsserver" {
+        // Type-aware resolution via typescript-language-server (allowJs/checkJs).
+        let js = JavaScriptAnalyzer;
+        js.analyze_with_resolution(
+            root,
+            spectograph_js::ResolutionMode::Tsserver,
+            tsserver_executable,
+            tsserver_timeout,
+        )
+        .map_err(|e| format!("analysis failed: {e}"))?
     } else {
         if resolution == "pyright" {
             return Err("--resolution pyright is only supported for python currently".to_string());
         }
         if resolution == "tsserver" {
             return Err(
-                "--resolution tsserver is only supported for typescript currently".to_string(),
+                "--resolution tsserver is only supported for typescript and javascript currently"
+                    .to_string(),
             );
         }
         analyzer

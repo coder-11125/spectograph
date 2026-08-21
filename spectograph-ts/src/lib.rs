@@ -4,7 +4,6 @@
 
 pub mod entrypoints;
 pub mod parse;
-pub mod tsserver;
 
 /// React support (component/prop/hook data types, naming-convention helpers,
 /// and [`react::find_prop_mismatches`]) is shared with `spectograph-js` rather
@@ -12,6 +11,12 @@ pub mod tsserver;
 /// separate explicit dependency just to use it.
 pub use spectograph_js::react;
 pub use spectograph_js::ReactAnalysis;
+
+/// The `typescript-language-server`-backed type-aware resolution backend lives
+/// in `spectograph-tsserver` since `spectograph-js` shares it (and can't
+/// depend on this crate, which already depends on `spectograph-js`) --
+/// re-exported here for ergonomic access.
+pub use spectograph_tsserver as tsserver;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -319,8 +324,14 @@ impl TypeScriptAnalyzer {
         let executable = tsserver_executable
             .map(str::to_string)
             .unwrap_or_else(|| "typescript-language-server".to_string());
-        let edges = tsserver::resolve_program_edges(root, &program, &executable, timeout_ms)
-            .map_err(|e| AnalyzeError::Io(std::io::Error::other(e.to_string())))?;
+        let edges = tsserver::resolve_program_edges(
+            root,
+            &program,
+            Language::TypeScript,
+            &executable,
+            timeout_ms,
+        )
+        .map_err(|e| AnalyzeError::Io(std::io::Error::other(e.to_string())))?;
         // Replace the static call-graph edges between queryable symbols with
         // the type-aware ones (same swap as spectograph-py's pyright backend).
         let queryable: std::collections::HashSet<SymbolId> = program

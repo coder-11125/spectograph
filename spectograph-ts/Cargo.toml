@@ -10,12 +10,11 @@ license.workspace = true
 spectograph-core.workspace = true
 spectograph-analyzer.workspace = true
 spectograph-js.workspace = true
+spectograph-tsserver.workspace = true
 tree-sitter = "0.25"
 tree-sitter-typescript = "0.23"
 serde_json.workspace = true
 serde.workspace = true
-thiserror.workspace = true
-lsp-types = "0.97"
 globset = "0.4"
 
 [dev-dependencies]

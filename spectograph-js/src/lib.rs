@@ -6,6 +6,12 @@ pub mod entrypoints;
 pub mod parse;
 pub mod react;
 
+/// The `typescript-language-server`-backed type-aware resolution backend
+/// lives in `spectograph-tsserver` since `spectograph-ts` also shares it (and
+/// this crate can't depend on `spectograph-ts`, which already depends on this
+/// crate for its React support) -- re-exported here for ergonomic access.
+pub use spectograph_tsserver as tsserver;
+
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
@@ -19,6 +25,17 @@ use spectograph_core::ir::{
 
 /// Analyzer for the JavaScript language.
 pub struct JavaScriptAnalyzer;
+
+/// Which reference-resolution backend to use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResolutionMode {
+    /// Hand-rolled static resolver (scope, module resolution, CommonJS/ESM
+    /// import handling).
+    Static,
+    /// `typescript-language-server` type-aware resolver (via LSP
+    /// find-references), running in `allowJs`/`checkJs` mode.
+    Tsserver,
+}
 
 /// A curated set of very common npm packages. Used to recognize bare import
 /// specifiers as legitimate external dependencies even when `node_modules` isn't
@@ -333,6 +350,58 @@ pub struct ReactAnalysis {
 }
 
 impl JavaScriptAnalyzer {
+    /// Analyze with a resolution backend. `Static` is equivalent to
+    /// [`Analyzer::analyze`].
+    pub fn analyze_with_resolution(
+        &self,
+        root: &Path,
+        resolution: ResolutionMode,
+        tsserver_executable: Option<&str>,
+        timeout_ms: u64,
+    ) -> Result<Program, AnalyzeError> {
+        let mut program = Analyzer::analyze(self, root)?;
+        if resolution == ResolutionMode::Static {
+            return Ok(program);
+        }
+        let executable = tsserver_executable
+            .map(str::to_string)
+            .unwrap_or_else(|| "typescript-language-server".to_string());
+        let edges = tsserver::resolve_program_edges(
+            root,
+            &program,
+            Language::JavaScript,
+            &executable,
+            timeout_ms,
+        )
+        .map_err(|e| AnalyzeError::Io(std::io::Error::other(e.to_string())))?;
+        // Replace the static call-graph edges between queryable symbols with
+        // the type-aware ones (same swap as spectograph-py's pyright backend
+        // and spectograph-ts's tsserver backend).
+        let queryable: HashSet<SymbolId> = program
+            .symbols
+            .iter()
+            .filter(|s| {
+                matches!(
+                    s.kind,
+                    SymbolKind::Function | SymbolKind::Class | SymbolKind::Const
+                )
+            })
+            .map(|s| s.id)
+            .collect();
+        program
+            .references
+            .retain(|r| !(queryable.contains(&r.from) && queryable.contains(&r.to)));
+        for (from, to) in edges {
+            program.references.push(Reference {
+                from,
+                to,
+                kind: RefKind::Static,
+                environment: Environment::Universal,
+            });
+        }
+        Ok(program)
+    }
+
     /// Like [`Analyzer::analyze`], but also returns React component/prop/hook
     /// data collected from JSX while parsing. Doesn't re-parse anything -- both
     /// results come from the same pass over the source.

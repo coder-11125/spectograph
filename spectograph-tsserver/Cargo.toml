@@ -1,0 +1,17 @@
+[package]
+name = "spectograph-tsserver"
+description = "typescript-language-server-backed type-aware reference resolution, shared by the JS and TS analyzers."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+spectograph-core.workspace = true
+spectograph-analyzer.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+lsp-types = "0.97"
+
+[dev-dependencies]
+tempfile = "3"

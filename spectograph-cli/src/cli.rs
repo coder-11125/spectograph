@@ -38,7 +38,7 @@ pub struct CheckArgs {
     pub fail_on: String,
 
     /// Reference-resolution backend: static (default), pyright (type-aware
-    /// Python), or tsserver (type-aware TypeScript).
+    /// Python), or tsserver (type-aware TypeScript/JavaScript).
     #[arg(long, default_value = "static", value_parser = ["static", "pyright", "tsserver"])]
     pub resolution: String,
 
