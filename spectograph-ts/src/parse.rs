@@ -54,6 +54,8 @@ pub struct FileResult {
     pub components: Vec<ReactComponent>,
     pub jsx_usages: Vec<JsxUsage>,
     pub hook_calls: Vec<HookCall>,
+    pub angular_selectors: Vec<crate::angular::AngularSelector>,
+    pub angular_pipes: Vec<crate::angular::AngularPipe>,
 }
 
 pub enum RefTarget {
@@ -164,6 +166,8 @@ pub fn parse_file(path: &Path, src: &str, module_id: SymbolId, next_id: &mut usi
     let mut refs = Vec::new();
     let mut imports = Vec::new();
     let mut decorators = Vec::new();
+    let mut angular_selectors = Vec::new();
+    let mut angular_pipes = Vec::new();
 
     symbols.push(symbol(
         module_id,
@@ -183,6 +187,8 @@ pub fn parse_file(path: &Path, src: &str, module_id: SymbolId, next_id: &mut usi
         &mut imports,
         &mut refs,
         &mut decorators,
+        &mut angular_selectors,
+        &mut angular_pipes,
     );
     collect_refs(root, src, module_id, &mut scopes, &mut refs);
     refs.extend(collect_react_lifecycle_edges(root, src, &symbols));
@@ -204,6 +210,8 @@ pub fn parse_file(path: &Path, src: &str, module_id: SymbolId, next_id: &mut usi
         components,
         jsx_usages,
         hook_calls,
+        angular_selectors,
+        angular_pipes,
     }
 }
 
@@ -218,6 +226,8 @@ fn collect_globals(
     imports: &mut Vec<ImportDecl>,
     refs: &mut Vec<UnresolvedRef>,
     decorators: &mut Vec<DecoratorInfo>,
+    angular_selectors: &mut Vec<crate::angular::AngularSelector>,
+    angular_pipes: &mut Vec<crate::angular::AngularPipe>,
 ) {
     let mut cursor = root.walk();
     for child in root.named_children(&mut cursor) {
@@ -280,11 +290,17 @@ fn collect_globals(
                     let mut dc = decl.walk();
                     for dec in decl.children_by_field_name("decorator", &mut dc) {
                         push_decorator(dec, DecoratorTarget::Symbol(id), path, src, decorators);
+                        collect_ngmodule_edges(dec, id, src, scopes, refs);
+                        angular_selectors.extend(extract_angular_selector(dec, id, path, src));
+                        angular_pipes.extend(extract_angular_pipe(dec, id, src));
                     }
                     if child.kind() == "export_statement" {
                         let mut ec = child.walk();
                         for dec in child.children_by_field_name("decorator", &mut ec) {
                             push_decorator(dec, DecoratorTarget::Symbol(id), path, src, decorators);
+                            collect_ngmodule_edges(dec, id, src, scopes, refs);
+                            angular_selectors.extend(extract_angular_selector(dec, id, path, src));
+                            angular_pipes.extend(extract_angular_pipe(dec, id, src));
                         }
                     }
 
@@ -485,7 +501,17 @@ fn collect_globals(
                 }
                 if let Some(body) = decl.child_by_field_name("body") {
                     collect_globals(
-                        body, path, src, next_id, symbols, scopes, imports, refs, decorators,
+                        body,
+                        path,
+                        src,
+                        next_id,
+                        symbols,
+                        scopes,
+                        imports,
+                        refs,
+                        decorators,
+                        angular_selectors,
+                        angular_pipes,
                     );
                 }
             }
@@ -494,7 +520,7 @@ fn collect_globals(
     }
 }
 
-fn strip_quotes(s: &str) -> String {
+pub(crate) fn strip_quotes(s: &str) -> String {
     s.trim_matches(['\'', '"', '`']).to_string()
 }
 
@@ -639,6 +665,200 @@ fn collect_di_edges(
             target,
             kind,
         });
+    }
+}
+
+/// `@NgModule`/`@Component` metadata properties whose array values reference
+/// other classes. Angular's module/standalone-component system wires these up
+/// through this array-of-class-references, not through any ordinary
+/// import-and-call in the analyzed code -- so without an edge here, every
+/// component/directive/pipe/service reachable only this way (which is most
+/// of them, in normal Angular code) looks unreachable and gets flagged as
+/// bloat. Same category of problem as `collect_di_edges`.
+const NG_REFERENCE_ARRAY_KEYS: &[&str] = &[
+    "declarations",
+    "imports",
+    "exports",
+    "bootstrap",
+    "providers",
+];
+
+/// A decorator's name and its call's metadata-object argument
+/// (`@Component({...})` -> `("Component", the {...} node)`), if it has one --
+/// `None` for a bare decorator (`@Injectable`) or one whose single argument
+/// isn't an object literal. Shared by every decorator-metadata interpreter
+/// (`collect_ngmodule_edges`, the Angular selector/template/pipe extractors)
+/// so the "is this actually `@Foo({...})`" check only lives in one place.
+fn decorator_metadata_object<'a>(dec: Node<'a>, src: &'a [u8]) -> Option<(&'a str, Node<'a>)> {
+    let inner = dec.named_child(0)?;
+    if inner.kind() != "call_expression" {
+        return None;
+    }
+    let name = inner
+        .child_by_field_name("function")
+        .map(|f| node_text(f, src))?;
+    let metadata = inner
+        .child_by_field_name("arguments")
+        .and_then(|a| a.named_child(0))
+        .filter(|m| m.kind() == "object")?;
+    Some((name, metadata))
+}
+
+/// A decorator metadata object's string-valued property (`selector: 'app-foo'`
+/// -> `Some("app-foo")`), if that key is present and its value is a plain
+/// string literal.
+fn string_property(metadata: Node, key: &str, src: &[u8]) -> Option<String> {
+    let mut mc = metadata.walk();
+    let pair = metadata.named_children(&mut mc).find(|p| {
+        p.kind() == "pair"
+            && p.child_by_field_name("key")
+                .map(|k| node_text(k, src) == key)
+                .unwrap_or(false)
+    })?;
+    let value = pair
+        .child_by_field_name("value")
+        .filter(|v| v.kind() == "string")?;
+    Some(
+        value
+            .named_child(0)
+            .map(|f| node_text(f, src))
+            .unwrap_or_default()
+            .to_string(),
+    )
+}
+
+/// Extract a `@Component`/`@Directive`'s selector list and (component-only)
+/// template source from its decorator metadata. `None` for decorators that
+/// aren't `@Component`/`@Directive`, or that declare no usable `selector` at
+/// all (nothing to match template usage against). An external
+/// `templateUrl` is resolved relative to the component's own file and read
+/// directly -- Angular CLI projects don't apply `tsconfig.json` path mapping
+/// to it, so this doesn't need the full module-resolution machinery.
+fn extract_angular_selector(
+    dec: Node,
+    class_id: SymbolId,
+    path: &Path,
+    src: &str,
+) -> Option<crate::angular::AngularSelector> {
+    let (decorator_name, metadata) = decorator_metadata_object(dec, src.as_bytes())?;
+    if !matches!(decorator_name, "Component" | "Directive") {
+        return None;
+    }
+    let selector_raw = string_property(metadata, "selector", src.as_bytes())?;
+    let names = crate::angular::parse_selector_names(&selector_raw);
+    if names.is_empty() {
+        return None;
+    }
+    let template = (decorator_name == "Component")
+        .then(|| {
+            string_property(metadata, "template", src.as_bytes()).or_else(|| {
+                let url = string_property(metadata, "templateUrl", src.as_bytes())?;
+                std::fs::read_to_string(path.parent().unwrap_or(path).join(url)).ok()
+            })
+        })
+        .flatten();
+    Some(crate::angular::AngularSelector {
+        class_id,
+        names,
+        template,
+        // `@Input`/`@Output` bindings aren't known yet at this point in
+        // parsing (member decorators are processed after the class's own),
+        // so this is a placeholder -- `build_angular_selectors` in lib.rs
+        // fills it in once every file's decorators are available.
+        declared_bindings: Vec::new(),
+        file: path.to_path_buf(),
+        line: span(dec).start_line,
+    })
+}
+
+/// Extract a `@Pipe`'s declared name from its decorator metadata.
+fn extract_angular_pipe(
+    dec: Node,
+    class_id: SymbolId,
+    src: &str,
+) -> Option<crate::angular::AngularPipe> {
+    let (decorator_name, metadata) = decorator_metadata_object(dec, src.as_bytes())?;
+    if decorator_name != "Pipe" {
+        return None;
+    }
+    let name = string_property(metadata, "name", src.as_bytes())?;
+    Some(crate::angular::AngularPipe { class_id, name })
+}
+
+/// For a class's `@NgModule(...)`/`@Component(...)` decorator, record that the
+/// class depends on every identifier found inside a `declarations`/`imports`/
+/// `exports`/`bootstrap`/`providers` array property of its metadata object --
+/// including ones nested inside a provider object (`{ provide: X, useClass: Y
+/// }` references both `X` and `Y`). Walking for *any* identifier rather than
+/// modeling each provider shape individually keeps this robust to Angular's
+/// several provider syntaxes without needing to special-case each one.
+fn collect_ngmodule_edges(
+    dec: Node,
+    class_id: SymbolId,
+    src: &str,
+    scopes: &Scopes,
+    refs: &mut Vec<UnresolvedRef>,
+) {
+    let Some((decorator_name, metadata)) = decorator_metadata_object(dec, src.as_bytes()) else {
+        return;
+    };
+    if !matches!(decorator_name, "NgModule" | "Component") {
+        return;
+    }
+    let mut mc = metadata.walk();
+    for pair in metadata.named_children(&mut mc) {
+        if pair.kind() != "pair" {
+            continue;
+        }
+        let Some(key) = pair
+            .child_by_field_name("key")
+            .map(|k| node_text(k, src.as_bytes()))
+        else {
+            continue;
+        };
+        if !NG_REFERENCE_ARRAY_KEYS.contains(&key) {
+            continue;
+        }
+        let Some(value) = pair
+            .child_by_field_name("value")
+            .filter(|v| v.kind() == "array")
+        else {
+            continue;
+        };
+        for name in collect_identifiers(value, src.as_bytes()) {
+            let target = match scopes.resolve(name) {
+                Some(Binding::Global(id)) => RefTarget::Symbol(id),
+                _ => RefTarget::Name(name.to_string()),
+            };
+            let kind = if matches!(target, RefTarget::Symbol(_)) {
+                RefKind::Static
+            } else {
+                RefKind::Dynamic
+            };
+            refs.push(UnresolvedRef {
+                from: class_id,
+                target,
+                kind,
+            });
+        }
+    }
+}
+
+/// Every `identifier` leaf found anywhere in `node`'s subtree.
+fn collect_identifiers<'a>(node: Node, src: &'a [u8]) -> Vec<&'a str> {
+    let mut out = Vec::new();
+    collect_identifiers_into(node, src, &mut out);
+    out
+}
+
+fn collect_identifiers_into<'a>(node: Node, src: &'a [u8], out: &mut Vec<&'a str>) {
+    if node.kind() == "identifier" {
+        out.push(node_text(node, src));
+        return;
+    }
+    let mut c = node.walk();
+    for child in node.named_children(&mut c) {
+        collect_identifiers_into(child, src, out);
     }
 }
 

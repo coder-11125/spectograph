@@ -2,6 +2,7 @@
 //!
 //! Parses TypeScript source with tree-sitter into the shared [`Program`] IR.
 
+pub mod angular;
 pub mod entrypoints;
 pub mod parse;
 
@@ -214,12 +215,18 @@ pub(crate) fn resolve_file_candidate(path: &Path) -> Option<PathBuf> {
     if path.is_file() {
         return Some(path.to_path_buf());
     }
-    if path.extension().is_none() {
-        for ext in ["ts", "tsx", "d.ts"] {
-            let candidate = path.with_extension(ext);
-            if candidate.is_file() {
-                return Some(candidate);
-            }
+    // Append, don't replace: `Path::with_extension` treats the text after the
+    // *last* dot in the file name as "the extension" and replaces it, which
+    // silently breaks any specifier whose real file name contains a dot
+    // before its actual extension (`./app.module` -> `app.module.ts`,
+    // `./foo.service` -> `foo.service.ts`, ... -- Angular's own file-naming
+    // convention for every file). `with_extension("ts")` on `app.module`
+    // produces `app.ts`, not `app.module.ts`, so the guessed candidate never
+    // exists and resolution fails outright.
+    for ext in ["ts", "tsx", "d.ts"] {
+        let candidate = PathBuf::from(format!("{}.{ext}", path.to_string_lossy()));
+        if candidate.is_file() {
+            return Some(candidate);
         }
     }
     if path.is_dir() {
@@ -305,6 +312,60 @@ fn resolve_module_path(
         }
     }
     None
+}
+
+/// Build the project-wide Angular selector list, with `@Input`/`@Output`
+/// binding names merged in from every file's decorators. Shared by the
+/// template-usage reachability-edge pass (`analyze_impl`) and
+/// `analyze_angular`'s binding-mismatch check, so the two don't drift.
+fn build_angular_selectors(
+    parsed: &[(PathBuf, parse::FileResult)],
+    global_names: &HashMap<String, SymbolId>,
+) -> Vec<angular::AngularSelector> {
+    let mut declared_bindings: HashMap<SymbolId, Vec<String>> = HashMap::new();
+    for (_path, result) in parsed {
+        for dec in &result.decorators {
+            if !matches!(dec.name.as_str(), "Input" | "Output") {
+                continue;
+            }
+            let parse::DecoratorTarget::Symbol(prop_id) = &dec.target else {
+                continue;
+            };
+            let Some(prop_sym) = result.symbols.iter().find(|s| s.id == *prop_id) else {
+                continue;
+            };
+            // Property symbols are always named "ClassName.propName".
+            let Some((class_name, prop_name)) = prop_sym.name.rsplit_once('.') else {
+                continue;
+            };
+            let Some(&class_id) = global_names.get(class_name) else {
+                continue;
+            };
+            // `@Input('customName')` binds under the alias, not the
+            // property's own name.
+            let binding_name = dec
+                .arguments
+                .first()
+                .map(|a| parse::strip_quotes(a))
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| prop_name.to_string());
+            declared_bindings
+                .entry(class_id)
+                .or_default()
+                .push(binding_name);
+        }
+    }
+
+    parsed
+        .iter()
+        .flat_map(|(_path, result)| result.angular_selectors.iter().cloned())
+        .map(|mut s| {
+            if let Some(bindings) = declared_bindings.get(&s.class_id) {
+                s.declared_bindings = bindings.clone();
+            }
+            s
+        })
+        .collect()
 }
 
 impl TypeScriptAnalyzer {
@@ -394,6 +455,29 @@ impl TypeScriptAnalyzer {
             react.hook_calls.extend(result.hook_calls);
         }
         Ok((program, react))
+    }
+
+    /// Like [`Analyzer::analyze`], but also returns every Angular template
+    /// binding mismatch found -- a `<app-child [foo]="x">` (or `(bar)=`,
+    /// `*directive=`) usage passing a binding the target component/directive
+    /// doesn't declare via `@Input()`/`@Output()`. Doesn't re-parse anything;
+    /// reuses the same selector/binding data the template-usage reachability
+    /// edges (already part of the main `analyze`/`Analyzer::analyze` result)
+    /// are built from.
+    pub fn analyze_angular(
+        &self,
+        root: &Path,
+    ) -> Result<(Program, Vec<angular::BindingMismatch>), AnalyzeError> {
+        let (program, parsed) = self.analyze_impl(root)?;
+        let mut global_names: HashMap<String, SymbolId> = HashMap::new();
+        for sym in &program.symbols {
+            if sym.kind != SymbolKind::Module {
+                global_names.entry(sym.name.clone()).or_insert(sym.id);
+            }
+        }
+        let selectors = build_angular_selectors(&parsed, &global_names);
+        let mismatches = angular::find_binding_mismatches(&selectors);
+        Ok((program, mismatches))
     }
 
     fn analyze_impl(
@@ -530,6 +614,27 @@ impl TypeScriptAnalyzer {
                     }
                 }
             }
+        }
+
+        // Pass: Angular template usage (component/directive tags and
+        // attributes, pipe names) -> reachability edges. Project-wide, unlike
+        // the other per-file decorator passes: a component's template
+        // commonly references a component/directive/pipe declared in a
+        // different file, so the selector/pipe maps have to be built from
+        // every file's decorators before any template can be matched against
+        // them.
+        let all_selectors = build_angular_selectors(&parsed, &global_names);
+        let all_pipes: Vec<angular::AngularPipe> = parsed
+            .iter()
+            .flat_map(|(_path, result)| result.angular_pipes.iter().cloned())
+            .collect();
+        for (from, to) in angular::collect_template_edges(&all_selectors, &all_pipes) {
+            program.references.push(Reference {
+                from,
+                to,
+                kind: RefKind::Static,
+                environment: Environment::Universal,
+            });
         }
 
         program.entrypoints = entrypoints::detect_entrypoint_symbols(&program, root);

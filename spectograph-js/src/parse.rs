@@ -1132,14 +1132,28 @@ fn collect_globals(
                 }
             }
             "import_statement" => {
+                // `node_text` on the "source" field returns the raw string
+                // literal, quote marks included (`'./utils'`, not `./utils`).
+                // Left unstripped, every downstream check that expects a bare
+                // path (`starts_with('.')` for relative imports, the
+                // node_modules directory-name lookup for bare specifiers)
+                // silently fails, so *no* ES6 `import ... from` ever resolved
+                // to its target file -- only `require(...)` calls did, since
+                // that path already stripped quotes.
                 let mut source = child
                     .child_by_field_name("source")
-                    .map(|s| node_text(s, src.as_bytes()).to_string())
+                    .map(|s| {
+                        node_text(s, src.as_bytes())
+                            .trim_matches(['\'', '"', '`'])
+                            .to_string()
+                    })
                     .unwrap_or_default();
                 if source.is_empty() {
                     if let Some(from) = child.child_by_field_name("_from_clause") {
                         if let Some(fs) = from.child_by_field_name("source") {
-                            source = node_text(fs, src.as_bytes()).to_string();
+                            source = node_text(fs, src.as_bytes())
+                                .trim_matches(['\'', '"', '`'])
+                                .to_string();
                         }
                     }
                 }

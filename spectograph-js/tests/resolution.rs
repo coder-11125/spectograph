@@ -89,6 +89,39 @@ console.log(x);"#,
     );
 }
 
+/// `node_text` on an import statement's "source" field returns the raw
+/// string literal, quote marks included (`'./utils'`, not `./utils`). Left
+/// unstripped, `starts_with('.')` (the relative-import check) never matches,
+/// so *no* ES6 `import ... from` ever resolved to its target file across
+/// files -- only `require(...)` calls did, since that path already stripped
+/// quotes. This was masked because no prior test asserted the actual
+/// cross-file reference edge for a plain (non-required) import, only that
+/// symbols existed on both sides.
+#[test]
+fn es6_import_resolves_to_cross_file_definition() {
+    let program = analyze_js(&[
+        ("main.js", "import { helper } from './utils.js';\nhelper();"),
+        ("utils.js", "export function helper() { return 2; }"),
+    ]);
+    let import_sym = program
+        .symbols
+        .iter()
+        .find(|s| s.name == "helper" && s.kind == SymbolKind::Import)
+        .expect("helper should be an Import symbol");
+    let helper_fn = program
+        .symbols
+        .iter()
+        .find(|s| s.name == "helper" && s.kind == SymbolKind::Function)
+        .expect("utils.js should export a helper function");
+    assert!(
+        program
+            .references
+            .iter()
+            .any(|r| r.from == import_sym.id && r.to == helper_fn.id),
+        "the import should resolve to utils.js's helper"
+    );
+}
+
 /// Cross-file usage through import - test that multiple files are parsed.
 #[test]
 fn cross_file_import_parses_both_files() {
@@ -104,6 +137,41 @@ fn cross_file_import_parses_both_files() {
     // Check that helper function exists
     let helper = program.symbols.iter().find(|s| s.name == "helper");
     assert!(helper.is_some(), "helper should be a symbol");
+}
+
+/// A specifier whose real file name contains a dot before its extension
+/// (`./foo.model` -> `foo.model.js`) must still resolve. `Path::with_extension`
+/// treats text after the *last* dot as "the extension" and replaces it, so
+/// naively guessing `foo.js` (dropping "model") silently fails to find the
+/// real file -- this is the module-resolution equivalent of the class of
+/// naming convention TypeScript/Angular projects use everywhere
+/// (`*.component.ts`, `*.service.ts`, ...), so it isn't a rare edge case.
+#[test]
+fn dotted_filename_relative_import_resolves() {
+    let program = analyze_js(&[
+        (
+            "main.js",
+            "import { helper } from './foo.model';\nhelper();",
+        ),
+        ("foo.model.js", "export function helper() { return 2; }"),
+    ]);
+    let import_sym = program
+        .symbols
+        .iter()
+        .find(|s| s.name == "helper" && s.kind == SymbolKind::Import)
+        .expect("helper should be an Import symbol");
+    let helper_fn = program
+        .symbols
+        .iter()
+        .find(|s| s.name == "helper" && s.kind == SymbolKind::Function)
+        .expect("foo.model.js should export a helper function");
+    assert!(
+        program
+            .references
+            .iter()
+            .any(|r| r.from == import_sym.id && r.to == helper_fn.id),
+        "the import should resolve to foo.model.js's helper, not fail to find the file at all"
+    );
 }
 
 /// Named import with alias - test that import statements are parsed.

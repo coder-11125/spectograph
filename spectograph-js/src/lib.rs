@@ -220,11 +220,16 @@ fn resolve_file_candidate(path: &Path) -> Option<PathBuf> {
     if path.is_file() {
         return Some(path.to_path_buf());
     }
-    if path.extension().is_none() {
-        let with_js = path.with_extension("js");
-        if with_js.is_file() {
-            return Some(with_js);
-        }
+    // Append, don't replace: `Path::with_extension` treats the text after the
+    // *last* dot in the file name as "the extension" and replaces it, which
+    // silently breaks any specifier whose real file name contains a dot
+    // before its actual extension (`./foo.model` -> `foo.model.js`,
+    // `./foo.test` -> `foo.test.js`, ...). `with_extension("js")` on
+    // `foo.model` produces `foo.js`, not `foo.model.js`, so the guessed
+    // candidate never exists and resolution fails outright.
+    let with_js = PathBuf::from(format!("{}.js", path.to_string_lossy()));
+    if with_js.is_file() {
+        return Some(with_js);
     }
     if path.is_dir() {
         let index_path = path.join("index.js");

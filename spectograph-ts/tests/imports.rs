@@ -278,6 +278,26 @@ fn relative_import_without_extension_resolves() {
 }
 
 #[test]
+fn dotted_filename_relative_import_resolves() {
+    // A specifier whose real file name contains a dot before its extension
+    // (`./app.module` -> `app.module.ts`) must still resolve.
+    // `Path::with_extension` treats text after the *last* dot as "the
+    // extension" and replaces it, so naively guessing `app.ts` (dropping
+    // "module") silently fails to find the real file -- and this naming
+    // convention (`*.component.ts`, `*.service.ts`, `*.module.ts`, ...) is
+    // how Angular projects name every single file, so it isn't a rare edge
+    // case.
+    let program = analyze_ts(&[
+        (
+            "main.ts",
+            "import { AppModule } from './app.module';\nconsole.log(AppModule);",
+        ),
+        ("app.module.ts", "export class AppModule {}"),
+    ]);
+    assert!(resolves(&program, "AppModule", "AppModule"));
+}
+
+#[test]
 fn relative_import_resolves_to_index_file() {
     let program = analyze_ts(&[
         ("main.ts", "import { helper } from './lib';\nhelper();"),
