@@ -13,13 +13,17 @@ pub mod parse;
 pub use spectograph_js::react;
 pub use spectograph_js::ReactAnalysis;
 
+/// Vue SFC (`.vue`) splitting/materialization is shared with `spectograph-js`
+/// for the same reason React support is -- see [`react`]'s doc comment.
+pub use spectograph_js::vue;
+
 /// The `typescript-language-server`-backed type-aware resolution backend lives
 /// in `spectograph-tsserver` since `spectograph-js` shares it (and can't
 /// depend on this crate, which already depends on `spectograph-js`) --
 /// re-exported here for ergonomic access.
 pub use spectograph_tsserver as tsserver;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use parse::parse_file;
@@ -223,14 +227,14 @@ pub(crate) fn resolve_file_candidate(path: &Path) -> Option<PathBuf> {
     // convention for every file). `with_extension("ts")` on `app.module`
     // produces `app.ts`, not `app.module.ts`, so the guessed candidate never
     // exists and resolution fails outright.
-    for ext in ["ts", "tsx", "d.ts"] {
+    for ext in ["ts", "tsx", "vue", "d.ts"] {
         let candidate = PathBuf::from(format!("{}.{ext}", path.to_string_lossy()));
         if candidate.is_file() {
             return Some(candidate);
         }
     }
     if path.is_dir() {
-        for name in ["index.ts", "index.tsx", "index.d.ts"] {
+        for name in ["index.ts", "index.tsx", "index.vue", "index.d.ts"] {
             let candidate = path.join(name);
             if candidate.is_file() {
                 return Some(candidate);
@@ -368,6 +372,90 @@ fn build_angular_selectors(
         .collect()
 }
 
+/// The three maps [`build_vue_scope_maps`] produces: local per-file scope,
+/// project-wide `app.component(...)` registrations, and canonical names.
+type VueScopeMaps = (
+    HashMap<(PathBuf, String), SymbolId>,
+    HashMap<String, SymbolId>,
+    HashMap<String, SymbolId>,
+);
+
+/// Build the Vue template-usage-matching maps: local per-file scope
+/// (resolved imports plus `defineAsyncComponent` bindings -- both already
+/// present in `program.references` as ReExport/Dynamic edges by the time
+/// this runs), project-wide `app.component(...)` registrations, and each
+/// component's own canonical name. Shared by the reachability-edge pass in
+/// `analyze_impl` and [`TypeScriptAnalyzer::analyze_vue_mismatches`], so
+/// the two can't silently drift apart -- same role as
+/// `build_angular_selectors` above. Mirrors `spectograph_js`'s copy of this
+/// function exactly, differing only in that `parsed`'s file keys are
+/// already `PathBuf` here.
+fn build_vue_scope_maps(
+    program: &Program,
+    parsed: &[(PathBuf, parse::FileResult)],
+) -> VueScopeMaps {
+    let vue_component_ids: HashSet<SymbolId> = parsed
+        .iter()
+        .filter_map(|(_p, r)| r.vue_component.as_ref().map(|c| c.symbol_id))
+        .collect();
+
+    let mut local_scope: HashMap<(PathBuf, String), SymbolId> = HashMap::new();
+    for (path, result) in parsed {
+        for imp in &result.imports {
+            let target = program
+                .references
+                .iter()
+                .find(|r| r.from == imp.symbol_id && r.kind == RefKind::ReExport)
+                .map(|r| r.to);
+            if let Some(target) = target {
+                if vue_component_ids.contains(&target) {
+                    local_scope.insert((path.clone(), imp.local_name.clone()), target);
+                }
+            }
+        }
+        for reg in &result.vue_async_components {
+            let Some(const_id) = result
+                .symbols
+                .iter()
+                .find(|s| s.name == reg.local_name && s.kind == SymbolKind::Const)
+                .map(|s| s.id)
+            else {
+                continue;
+            };
+            let target = program
+                .references
+                .iter()
+                .find(|r| r.from == const_id && r.kind == RefKind::Dynamic)
+                .map(|r| r.to);
+            if let Some(target) = target {
+                if vue_component_ids.contains(&target) {
+                    local_scope.insert((path.clone(), reg.local_name.clone()), target);
+                }
+            }
+        }
+    }
+
+    let mut global_components: HashMap<String, SymbolId> = HashMap::new();
+    for (path, result) in parsed {
+        for reg in &result.vue_global_registrations {
+            if let Some(&target) = local_scope.get(&(path.clone(), reg.local_identifier.clone())) {
+                global_components
+                    .entry(vue::kebab_to_pascal(&reg.tag_name))
+                    .or_insert(target);
+            }
+        }
+    }
+
+    let mut canonical_names: HashMap<String, SymbolId> = HashMap::new();
+    for (_path, result) in parsed {
+        if let Some(c) = &result.vue_component {
+            canonical_names.entry(c.name.clone()).or_insert(c.symbol_id);
+        }
+    }
+
+    (local_scope, global_components, canonical_names)
+}
+
 impl TypeScriptAnalyzer {
     /// Analyze with a resolution backend. `Static` is equivalent to
     /// [`Analyzer::analyze`].
@@ -480,6 +568,78 @@ impl TypeScriptAnalyzer {
         Ok((program, mismatches))
     }
 
+    /// Like [`Analyzer::analyze`], but also returns Vue component/prop/emit
+    /// data collected from `.vue` files' `lang="ts"` script blocks while
+    /// parsing. Doesn't re-parse anything -- reuses `spectograph_js`'s
+    /// [`spectograph_js::VueAnalysis`] type directly rather than duplicating
+    /// it, the same as [`Self::analyze_react`] does for React data.
+    pub fn analyze_vue(
+        &self,
+        root: &Path,
+    ) -> Result<(Program, spectograph_js::VueAnalysis), AnalyzeError> {
+        let (program, parsed) = self.analyze_impl(root)?;
+        let mut vue = spectograph_js::VueAnalysis::default();
+        for (_path, result) in parsed {
+            vue.components.extend(result.vue_component);
+        }
+        Ok((program, vue))
+    }
+
+    /// Like [`Analyzer::analyze`], but also returns every Vue template
+    /// prop/emit mismatch found. Mirrors
+    /// [`spectograph_js::JavaScriptAnalyzer::analyze_vue_mismatches`]
+    /// exactly -- see its doc comment.
+    pub fn analyze_vue_mismatches(
+        &self,
+        root: &Path,
+    ) -> Result<(Program, Vec<vue::VueBindingMismatch>), AnalyzeError> {
+        let (program, parsed) = self.analyze_impl(root)?;
+        let (local_scope, global_components, canonical_names) =
+            build_vue_scope_maps(&program, &parsed);
+
+        let using_symbol_by_path: HashMap<PathBuf, SymbolId> = parsed
+            .iter()
+            .map(|(path, result)| {
+                let using = result
+                    .vue_component
+                    .as_ref()
+                    .map(|c| c.symbol_id)
+                    .unwrap_or(result.module_id);
+                (path.clone(), using)
+            })
+            .collect();
+
+        let mut sites: Vec<vue::TemplateUsageSite> = Vec::new();
+        for path in vue::discover_vue_files(root)? {
+            let src = std::fs::read_to_string(&path)?;
+            let sfc = vue::parse_sfc(&src);
+            let (Some(template), Some(&using_symbol)) =
+                (sfc.template, using_symbol_by_path.get(&path))
+            else {
+                continue;
+            };
+            sites.push(vue::TemplateUsageSite {
+                file: path,
+                template: template.content,
+                using_symbol,
+            });
+        }
+
+        let components: Vec<vue::VueComponent> = parsed
+            .iter()
+            .filter_map(|(_p, r)| r.vue_component.clone())
+            .collect();
+
+        let mismatches = vue::find_binding_mismatches(
+            &components,
+            &sites,
+            &local_scope,
+            &global_components,
+            &canonical_names,
+        );
+        Ok((program, mismatches))
+    }
+
     fn analyze_impl(
         &self,
         root: &Path,
@@ -490,7 +650,47 @@ impl TypeScriptAnalyzer {
             root,
             &tsconfig,
         );
-        if files.is_empty() {
+
+        // `.vue` Single-File Components aren't owned by `Language::TypeScript`'s
+        // extension list -- only the ones with a `lang="ts"` script block
+        // belong to this analyzer; a plain (untyped) `<script>`/`<script setup>`
+        // is `spectograph_js::JavaScriptAnalyzer`'s to parse. Not run through
+        // `filter_by_tsconfig`: a tsconfig covering a Vue project would need an
+        // explicit `"**/*.vue"` include entry to match here, which is a
+        // refinement for later rather than this foundational wiring.
+        // `materialize_script` gives back source text with each script block's
+        // lines at their true position in the `.vue` file (blank elsewhere),
+        // parseable exactly like a regular file below.
+        let mut file_sources: Vec<(PathBuf, String)> = Vec::new();
+        for path in &files {
+            let src = std::fs::read_to_string(path)?;
+            file_sources.push((path.clone(), src));
+        }
+        // Captured alongside `file_sources` for the Vue template-usage
+        // reachability pass below, scoped to exactly the `.vue` files this
+        // analyzer actually parses (an untyped file's template is scanned by
+        // `JavaScriptAnalyzer` instead -- see that crate's mirror of this loop).
+        let mut vue_templates: Vec<(PathBuf, String)> = Vec::new();
+        // Paths whose `.vue` file has a `<script setup>` block -- threaded
+        // into `parse_file` below since a bare `<script setup>` (no
+        // `defineProps`/`defineEmits` macro call) is otherwise
+        // indistinguishable from a plain non-Vue file once materialized.
+        let mut vue_script_setup_files: HashSet<PathBuf> = HashSet::new();
+        for path in vue::discover_vue_files(root)? {
+            let src = std::fs::read_to_string(&path)?;
+            let sfc = vue::parse_sfc(&src);
+            if let Some((materialized, vue::ScriptLang::TypeScript)) = vue::materialize_script(&sfc)
+            {
+                if let Some(template) = &sfc.template {
+                    vue_templates.push((path.clone(), template.content.clone()));
+                }
+                if sfc.script_setup.is_some() {
+                    vue_script_setup_files.insert(path.clone());
+                }
+                file_sources.push((path, materialized));
+            }
+        }
+        if file_sources.is_empty() {
             return Err(AnalyzeError::NoSourceFiles(root.display().to_string()));
         }
 
@@ -510,12 +710,17 @@ impl TypeScriptAnalyzer {
         let mut def_index: HashMap<String, SymbolId> = HashMap::new();
 
         let mut parsed: Vec<(PathBuf, parse::FileResult)> = Vec::new();
-        for path in &files {
-            let src = std::fs::read_to_string(path)?;
+        for (path, src) in &file_sources {
             let module_id = next_id;
             next_id += 1;
 
-            let result = parse_file(path, &src, module_id, &mut next_id);
+            let result = parse_file(
+                path,
+                src,
+                module_id,
+                &mut next_id,
+                vue_script_setup_files.contains(path),
+            );
 
             for sym in &result.symbols {
                 if sym.kind != SymbolKind::Module {
@@ -637,7 +842,111 @@ impl TypeScriptAnalyzer {
             });
         }
 
+        // Pass: resolve `const X = defineAsyncComponent(() => import(
+        // './X.vue'))` bindings the same way a static import resolves, but
+        // as a `Dynamic` edge -- this genuinely is a runtime code-split
+        // boundary, not a statically-guaranteed-present import. Mirrors
+        // `spectograph_js`'s copy of this pass exactly, differing only in
+        // that `parsed`'s file keys are already `PathBuf` here and
+        // `resolve_module_path` takes `root`/`tsconfig` instead of a
+        // browser-field map.
+        for (path, result) in &parsed {
+            let base = path.parent().unwrap_or(path);
+            for reg in &result.vue_async_components {
+                let Some(source_path) = resolve_module_path(base, &reg.source, root, &tsconfig)
+                else {
+                    continue;
+                };
+                let source_path_str = source_path.to_string_lossy().into_owned();
+                let Some(&target_module_id) = module_paths.get(&source_path_str) else {
+                    continue;
+                };
+                let Some(target_component_id) = parsed
+                    .iter()
+                    .find(|(_p, r)| r.module_id == target_module_id)
+                    .and_then(|(_p, r)| r.vue_component.as_ref())
+                    .map(|c| c.symbol_id)
+                else {
+                    continue;
+                };
+                let Some(local_const_id) = result
+                    .symbols
+                    .iter()
+                    .find(|s| s.name == reg.local_name && s.kind == SymbolKind::Const)
+                    .map(|s| s.id)
+                else {
+                    continue;
+                };
+                program.references.push(Reference {
+                    from: local_const_id,
+                    to: target_component_id,
+                    kind: RefKind::Dynamic,
+                    environment: Environment::Universal,
+                });
+            }
+        }
+
+        // Pass: Vue template usage (component tags, `:is` dynamic bindings)
+        // -> reachability edges. See `vue::collect_template_edges`.
+        {
+            let (local_scope, global_components, canonical_names) =
+                build_vue_scope_maps(&program, &parsed);
+
+            let using_symbol_by_path: HashMap<PathBuf, SymbolId> = parsed
+                .iter()
+                .map(|(path, result)| {
+                    let using = result
+                        .vue_component
+                        .as_ref()
+                        .map(|c| c.symbol_id)
+                        .unwrap_or(result.module_id);
+                    (path.clone(), using)
+                })
+                .collect();
+
+            let sites: Vec<vue::TemplateUsageSite> = vue_templates
+                .into_iter()
+                .filter_map(|(file, template)| {
+                    using_symbol_by_path
+                        .get(&file)
+                        .map(|&using_symbol| vue::TemplateUsageSite {
+                            file,
+                            template,
+                            using_symbol,
+                        })
+                })
+                .collect();
+
+            for (from, to) in vue::collect_template_edges(
+                &sites,
+                &local_scope,
+                &global_components,
+                &canonical_names,
+            ) {
+                program.references.push(Reference {
+                    from,
+                    to,
+                    kind: RefKind::Static,
+                    environment: Environment::Universal,
+                });
+            }
+        }
+
         program.entrypoints = entrypoints::detect_entrypoint_symbols(&program, root);
+
+        // A `createApp(...).mount(...)` file is always the app's real
+        // entrypoint, whatever its name or `package.json`'s `main` field
+        // say -- added on top of (not instead of) the detection above.
+        // Especially relevant here: TS's entrypoint detection is far more
+        // restrictive than JS's permissive "every module" fallback (see
+        // `entrypoints::detect_entrypoint_symbols`'s own doc comment), so a
+        // Vue bootstrap file that isn't named `main.ts`/`index.ts` and
+        // isn't `package.json`'s `main` would otherwise be missed entirely.
+        for (_path, result) in &parsed {
+            if result.vue_app_mount && !program.entrypoints.contains(&result.module_id) {
+                program.entrypoints.push(result.module_id);
+            }
+        }
 
         Ok((program, parsed))
     }

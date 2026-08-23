@@ -3,8 +3,9 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use spectograph_core::ir::{RefKind, SourceSpan, Symbol, SymbolId, SymbolKind};
+use spectograph_core::ir::{Environment, RefKind, SourceSpan, Symbol, SymbolId, SymbolKind};
 use spectograph_js::react::{is_component_name, is_hook_name, HookCall, JsxUsage, ReactComponent};
+use spectograph_js::vue::{self, VueAsyncComponent, VueComponent, VueGlobalRegistration};
 use tree_sitter::{Node, Parser};
 
 #[derive(Clone, Copy, PartialEq)]
@@ -56,6 +57,13 @@ pub struct FileResult {
     pub hook_calls: Vec<HookCall>,
     pub angular_selectors: Vec<crate::angular::AngularSelector>,
     pub angular_pipes: Vec<crate::angular::AngularPipe>,
+    pub vue_component: Option<spectograph_js::vue::VueComponent>,
+    pub vue_global_registrations: Vec<VueGlobalRegistration>,
+    pub vue_async_components: Vec<VueAsyncComponent>,
+    /// True if this file calls `createApp(...).mount(...)` -- Vue's
+    /// bootstrap convention, used to mark it as an entrypoint independent
+    /// of its filename/`package.json` (see [`vue::has_vue_app_mount`]).
+    pub vue_app_mount: bool,
 }
 
 pub enum RefTarget {
@@ -147,8 +155,15 @@ fn is_under_node_modules(path: &Path) -> bool {
 
 /// Parse a single TypeScript file. `.tsx` files use the TSX grammar dialect
 /// (needed to disambiguate JSX from TypeScript's generic/type-assertion syntax);
-/// everything else uses the plain TypeScript grammar.
-pub fn parse_file(path: &Path, src: &str, module_id: SymbolId, next_id: &mut usize) -> FileResult {
+/// everything else uses the plain TypeScript grammar. `is_vue_script_setup`
+/// mirrors `spectograph_js::parse::parse_file`'s parameter of the same name.
+pub fn parse_file(
+    path: &Path,
+    src: &str,
+    module_id: SymbolId,
+    next_id: &mut usize,
+    is_vue_script_setup: bool,
+) -> FileResult {
     let mut parser = Parser::new();
     let is_tsx = path.extension().and_then(|e| e.to_str()) == Some("tsx");
     let lang = if is_tsx {
@@ -200,6 +215,21 @@ pub fn parse_file(path: &Path, src: &str, module_id: SymbolId, next_id: &mut usi
     }
 
     let (components, jsx_usages, hook_calls) = detect_react(root, path, src, module_id, &symbols);
+    let vue_component =
+        detect_vue_component(root, path, src, next_id, &mut symbols, is_vue_script_setup);
+    let mut vue_global_registrations = Vec::new();
+    collect_vue_global_registrations(root, src, &mut vue_global_registrations);
+    let vue_async_components = detect_vue_async_components(root, src);
+    let vue_app_mount = vue::has_vue_app_mount(root, src);
+    if vue_app_mount {
+        // The module symbol is always pushed first, above. Mounting to the
+        // DOM is inherently a browser-only operation, so the whole file
+        // gets tagged. TS's own `symbol()` helper always hardcodes
+        // `Environment::Universal` (unlike JS's, this crate does no
+        // environment-guard inference at all) -- this is the first signal
+        // that ever overrides it.
+        symbols[0].environment = Environment::Browser;
+    }
 
     FileResult {
         module_id,
@@ -212,6 +242,10 @@ pub fn parse_file(path: &Path, src: &str, module_id: SymbolId, next_id: &mut usi
         hook_calls,
         angular_selectors,
         angular_pipes,
+        vue_component,
+        vue_global_registrations,
+        vue_async_components,
+        vue_app_mount,
     }
 }
 
@@ -1771,6 +1805,302 @@ fn detect_react(
     );
 
     (components, jsx_usages, hook_calls)
+}
+
+/// Detect this file's Vue component: the Options API's `export default {
+/// name, props, emits, ... }` object, and/or `<script setup>`'s
+/// `defineProps(...)`/`defineEmits(...)` compiler macros. Gated on `.vue`
+/// file extension, for the same reason `spectograph_js::parse`'s copy of
+/// this function is -- see its doc comment, which this mirrors exactly for
+/// the plain-runtime-argument forms.
+///
+/// The one addition here, needing the TS grammar specifically:
+/// `defineProps<T>()`/`defineEmits<T>()`'s generic *type*-argument form
+/// (`const props = defineProps<{ label: string; count?: number }>()`), with
+/// no runtime argument at all. `T`'s member names are extracted the same way
+/// an interface/type-alias's declared props already are for typed React
+/// components -- see [`object_member_names`]. `defineEmits<T>()`'s older
+/// call-signature form (`{ (e: 'change', v: string): void }`) isn't handled
+/// -- `object_member_names` only reads `property_signature` members, so
+/// that shape yields an (indistinguishable-from-"didn't declare any") empty
+/// list rather than a wrong one.
+///
+/// `is_vue_script_setup` mirrors `spectograph_js::parse`'s copy of this
+/// function -- see its doc comment for why it's needed.
+fn detect_vue_component(
+    root: Node,
+    path: &Path,
+    src: &str,
+    next_id: &mut usize,
+    symbols: &mut Vec<Symbol>,
+    is_vue_script_setup: bool,
+) -> Option<VueComponent> {
+    if path.extension().and_then(|e| e.to_str()) != Some("vue") {
+        return None;
+    }
+
+    let mut declared_props = Vec::new();
+    let mut declared_emits = Vec::new();
+    let mut explicit_name: Option<String> = None;
+    let mut anchor: Option<Node> = None;
+
+    // Options API: `export default { name: 'Foo', props: [...], emits: [...], ... }`.
+    let mut cursor = root.walk();
+    for child in root.named_children(&mut cursor) {
+        if child.kind() != "export_statement" {
+            continue;
+        }
+        let Some(value) = child.child_by_field_name("value") else {
+            continue;
+        };
+        if value.kind() != "object" {
+            continue;
+        }
+        anchor = Some(child);
+        let mut oc = value.walk();
+        for prop in value.named_children(&mut oc) {
+            if prop.kind() != "pair" {
+                continue;
+            }
+            let (Some(key), Some(prop_value)) = (
+                prop.child_by_field_name("key"),
+                prop.child_by_field_name("value"),
+            ) else {
+                continue;
+            };
+            match node_text(key, src.as_bytes()) {
+                "name" if prop_value.kind() == "string" => {
+                    explicit_name = prop_value
+                        .named_child(0)
+                        .map(|n| node_text(n, src.as_bytes()).to_string());
+                }
+                "props" => {
+                    declared_props =
+                        vue::extract_names_from_array_or_object(prop_value, src.as_bytes());
+                }
+                "emits" => {
+                    declared_emits =
+                        vue::extract_names_from_array_or_object(prop_value, src.as_bytes());
+                }
+                _ => {}
+            }
+        }
+    }
+
+    // Composition API: `<script setup>`'s `defineProps(...)`/`defineEmits(...)`
+    // compiler macros -- callable bare (no import) anywhere at the module's
+    // top level. Their mere presence, regardless of which original `<script>`
+    // block contributed these lines after SFC materialization, is what marks
+    // this file as using `<script setup>`: Vue itself only allows them there.
+    let mut cursor = root.walk();
+    for child in root.named_children(&mut cursor) {
+        let Some(call) = top_level_call(child) else {
+            continue;
+        };
+        let Some(func) = call.child_by_field_name("function") else {
+            continue;
+        };
+        if func.kind() != "identifier" {
+            continue;
+        }
+        let is_props = node_text(func, src.as_bytes()) == "defineProps";
+        let is_emits = node_text(func, src.as_bytes()) == "defineEmits";
+        if !is_props && !is_emits {
+            continue;
+        }
+        anchor.get_or_insert(child);
+
+        // Runtime-argument form: `defineProps({...})`/`defineProps([...])`.
+        let runtime_names = call
+            .child_by_field_name("arguments")
+            .and_then(|a| a.named_child(0))
+            .map(|arg| vue::extract_names_from_array_or_object(arg, src.as_bytes()));
+        // Generic type-argument form: `defineProps<{ a: string }>()`, TS-only.
+        let type_names = call
+            .child_by_field_name("type_arguments")
+            .and_then(|ta| ta.named_child(0))
+            .filter(|t| t.kind() == "object_type")
+            .map(|t| object_member_names(t, src.as_bytes()));
+        let Some(names) = runtime_names.or(type_names) else {
+            continue;
+        };
+        if is_props {
+            declared_props = names;
+        } else {
+            declared_emits = names;
+        }
+    }
+
+    // A bare `<script setup>` with no macro calls and no Options-API object
+    // still declares a component -- see `spectograph_js::parse`'s copy of
+    // this fallback for why.
+    let anchor = anchor.or(is_vue_script_setup.then_some(root))?;
+    let name = explicit_name.unwrap_or_else(|| vue::component_name_from_path(path));
+    let id = *next_id;
+    *next_id += 1;
+    symbols.push(symbol(id, &name, SymbolKind::Const, path, anchor));
+
+    Some(VueComponent {
+        symbol_id: id,
+        name,
+        file: path.to_path_buf(),
+        line: span(anchor).start_line,
+        declared_props,
+        declared_emits,
+    })
+}
+
+/// If `node` is a top-level statement wrapping a single bare call expression
+/// -- `defineProps(...)` as its own statement, or `const props =
+/// defineProps(...)` -- return that call. Vue's `<script setup>` macros are
+/// used almost exclusively in one of these two shapes. Mirrors
+/// `spectograph_js::parse`'s copy exactly -- these statement/declarator node
+/// shapes don't differ between the JS and TS grammars.
+fn top_level_call(node: Node) -> Option<Node> {
+    match node.kind() {
+        "expression_statement" => {
+            let expr = node.named_child(0)?;
+            (expr.kind() == "call_expression").then_some(expr)
+        }
+        "lexical_declaration" | "variable_declaration" => {
+            let mut c = node.walk();
+            for d in node.named_children(&mut c) {
+                if d.kind() != "variable_declarator" {
+                    continue;
+                }
+                if let Some(value) = d.child_by_field_name("value") {
+                    if value.kind() == "call_expression" {
+                        return Some(value);
+                    }
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+/// Recursively collect `<expr>.component('Name', LocalIdent)` calls anywhere
+/// in the file -- Vue's global component registration API. Mirrors
+/// `spectograph_js::parse`'s copy exactly; see [`VueGlobalRegistration`] for
+/// the matching caveats.
+fn collect_vue_global_registrations(node: Node, src: &str, out: &mut Vec<VueGlobalRegistration>) {
+    if node.kind() == "call_expression" {
+        if let Some(reg) = vue_global_registration_call(node, src) {
+            out.push(reg);
+        }
+    }
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        collect_vue_global_registrations(child, src, out);
+    }
+}
+
+/// If `call` is `<expr>.component('Name', LocalIdent)`, extract the
+/// registration. Mirrors `spectograph_js::parse`'s copy exactly.
+fn vue_global_registration_call(call: Node, src: &str) -> Option<VueGlobalRegistration> {
+    let func = call.child_by_field_name("function")?;
+    if func.kind() != "member_expression" {
+        return None;
+    }
+    let property = func.child_by_field_name("property")?;
+    if node_text(property, src.as_bytes()) != "component" {
+        return None;
+    }
+    let args = call.child_by_field_name("arguments")?;
+    let mut ac = args.walk();
+    let named: Vec<Node> = args.named_children(&mut ac).collect();
+    let [name_arg, ident_arg] = named.as_slice() else {
+        return None;
+    };
+    if name_arg.kind() != "string" || ident_arg.kind() != "identifier" {
+        return None;
+    }
+    let tag_name = name_arg
+        .named_child(0)
+        .map(|n| node_text(n, src.as_bytes()).to_string())?;
+    Some(VueGlobalRegistration {
+        tag_name,
+        local_identifier: node_text(*ident_arg, src.as_bytes()).to_string(),
+    })
+}
+
+/// Find every top-level `const X = defineAsyncComponent(<factory>)`
+/// binding. Mirrors `spectograph_js::parse`'s copy exactly -- these
+/// statement/declarator/call node shapes don't differ between the JS and TS
+/// grammars.
+fn detect_vue_async_components(root: Node, src: &str) -> Vec<VueAsyncComponent> {
+    let mut out = Vec::new();
+    let mut cursor = root.walk();
+    for child in root.named_children(&mut cursor) {
+        if !matches!(child.kind(), "lexical_declaration" | "variable_declaration") {
+            continue;
+        }
+        let mut dc = child.walk();
+        for d in child.named_children(&mut dc) {
+            if d.kind() != "variable_declarator" {
+                continue;
+            }
+            let (Some(name_node), Some(value)) = (
+                d.child_by_field_name("name"),
+                d.child_by_field_name("value"),
+            ) else {
+                continue;
+            };
+            if name_node.kind() != "identifier" {
+                continue;
+            }
+            if let Some(source) = async_component_import_source(value, src) {
+                out.push(VueAsyncComponent {
+                    local_name: node_text(name_node, src.as_bytes()).to_string(),
+                    source,
+                });
+            }
+        }
+    }
+    out
+}
+
+/// If `value` is `defineAsyncComponent(<factory>)` and `<factory>`'s body
+/// is (or directly `return`s) a dynamic `import('...')` call, return the
+/// specifier. Mirrors `spectograph_js::parse`'s copy exactly.
+fn async_component_import_source(value: Node, src: &str) -> Option<String> {
+    if value.kind() != "call_expression" {
+        return None;
+    }
+    let func = value.child_by_field_name("function")?;
+    if func.kind() != "identifier" || node_text(func, src.as_bytes()) != "defineAsyncComponent" {
+        return None;
+    }
+    let factory = value.child_by_field_name("arguments")?.named_child(0)?;
+    if !matches!(factory.kind(), "arrow_function" | "function_expression") {
+        return None;
+    }
+    let body = factory.child_by_field_name("body")?;
+    let call = if body.kind() == "call_expression" {
+        body
+    } else if body.kind() == "statement_block" {
+        let mut bc = body.walk();
+        let mut found = None;
+        for n in body.named_children(&mut bc) {
+            if n.kind() == "return_statement" {
+                found = n.named_child(0).filter(|c| c.kind() == "call_expression");
+                break;
+            }
+        }
+        found?
+    } else {
+        return None;
+    };
+    if call.child_by_field_name("function")?.kind() != "import" {
+        return None;
+    }
+    let arg = call.child_by_field_name("arguments")?.named_child(0)?;
+    if arg.kind() != "string" {
+        return None;
+    }
+    arg.named_child(0)
+        .map(|n| node_text(n, src.as_bytes()).to_string())
 }
 
 /// Recursively collect JSX usage sites and hook calls, tracking which named

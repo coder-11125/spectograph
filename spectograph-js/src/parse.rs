@@ -7,6 +7,7 @@ use spectograph_core::ir::{Environment, RefKind, SourceSpan, Symbol, SymbolId, S
 use tree_sitter::{Node, Parser};
 
 use crate::react::{is_component_name, is_hook_name, HookCall, JsxUsage, ReactComponent};
+use crate::vue::{self, VueAsyncComponent, VueComponent, VueGlobalRegistration};
 
 /// Environment-indicative globals: identifiers whose mere presence in `typeof X`
 /// (a guard) or as a bare reference signals that surrounding code targets one
@@ -128,6 +129,13 @@ pub struct FileResult {
     pub components: Vec<ReactComponent>,
     pub jsx_usages: Vec<JsxUsage>,
     pub hook_calls: Vec<HookCall>,
+    pub vue_component: Option<VueComponent>,
+    pub vue_global_registrations: Vec<VueGlobalRegistration>,
+    pub vue_async_components: Vec<VueAsyncComponent>,
+    /// True if this file calls `createApp(...).mount(...)` -- Vue's
+    /// bootstrap convention, used to mark it as an entrypoint independent
+    /// of its filename/`package.json` (see [`vue::has_vue_app_mount`]).
+    pub vue_app_mount: bool,
 }
 
 pub struct ImportDecl {
@@ -188,8 +196,19 @@ fn is_under_node_modules(path: &Path) -> bool {
     path.components().any(|c| c.as_os_str() == "node_modules")
 }
 
-/// Parse a single JavaScript file.
-pub fn parse_file(path: &Path, src: &str, module_id: SymbolId, next_id: &mut usize) -> FileResult {
+/// Parse a single JavaScript file. `is_vue_script_setup` is true only for
+/// the materialized script of a `.vue` file that has a `<script setup>`
+/// block -- a signal [`detect_vue_component`] needs but can't recover from
+/// the materialized text alone (materialization strips the `<script setup>`
+/// tag itself, leaving no marker that the source came from one). Always
+/// `false` for a plain (non-`.vue`) file.
+pub fn parse_file(
+    path: &Path,
+    src: &str,
+    module_id: SymbolId,
+    next_id: &mut usize,
+    is_vue_script_setup: bool,
+) -> FileResult {
     let mut parser = Parser::new();
     let lang = tree_sitter_javascript::LANGUAGE.into();
     parser.set_language(&lang).expect("javascript grammar");
@@ -244,6 +263,20 @@ pub fn parse_file(path: &Path, src: &str, module_id: SymbolId, next_id: &mut usi
     }
 
     let (components, jsx_usages, hook_calls) = detect_react(root, path, src, module_id, &symbols);
+    let vue_component =
+        detect_vue_component(root, path, src, next_id, &mut symbols, is_vue_script_setup);
+    let mut vue_global_registrations = Vec::new();
+    collect_vue_global_registrations(root, src, &mut vue_global_registrations);
+    let vue_async_components = detect_vue_async_components(root, src);
+    let vue_app_mount = vue::has_vue_app_mount(root, src);
+    if vue_app_mount {
+        // The module symbol is always pushed first, above. Mounting to the
+        // DOM is inherently a browser-only operation, so the whole file
+        // gets tagged -- same "environment inference" vocabulary as
+        // `env_of_global`'s `window`/`document` guard detection, just from
+        // a Vue-specific signal instead of a bare global reference.
+        symbols[0].environment = Environment::Browser;
+    }
 
     FileResult {
         module_id,
@@ -253,6 +286,10 @@ pub fn parse_file(path: &Path, src: &str, module_id: SymbolId, next_id: &mut usi
         components,
         jsx_usages,
         hook_calls,
+        vue_component,
+        vue_global_registrations,
+        vue_async_components,
+        vue_app_mount,
     }
 }
 
@@ -596,6 +633,318 @@ fn detect_react(
     );
 
     (components, jsx_usages, hook_calls)
+}
+
+/// Detect this file's Vue component: the Options API's `export default {
+/// name, props, emits, ... }` object, and/or `<script setup>`'s
+/// `defineProps(...)`/`defineEmits(...)` compiler macros. Gated on `.vue`
+/// file extension -- an Options-API-shaped object literal (`{ props: [...],
+/// data() {...} }`) is plain JS syntax otherwise, and not a reliable enough
+/// signal to detect outside an actual SFC (unlike JSX, which React detection
+/// can key off directly). Mints a new `Const` symbol for the component when
+/// nothing already names it (the default-export object and the implicit
+/// `<script setup>` component are both anonymous), so it participates in the
+/// ordinary symbol/reference graph -- the one way this differs from
+/// [`detect_react`], where a component is always an already-named
+/// declaration and never needs a symbol minted for it.
+///
+/// One Vue-specific limitation, not shared with `detect_react`: only the
+/// plain-JavaScript runtime forms of `defineProps`/`defineEmits` (an array
+/// or object literal argument) are handled here. TypeScript's
+/// `defineProps<T>()` generic-type-argument form needs the TS grammar's
+/// `object_type`/`property_signature` nodes, which don't exist in plain
+/// JavaScript source at all -- see `spectograph_ts::parse`'s own
+/// `detect_vue_component` for that half.
+///
+/// `is_vue_script_setup` covers a `<script setup>` block that declares no
+/// props/emits at all (a component with none is completely ordinary --
+/// e.g. most root `App.vue` files): without this signal, such a file would
+/// have neither an Options-API object nor a `defineProps`/`defineEmits` call
+/// to anchor a component on, and would wrongly be detected as having none.
+fn detect_vue_component(
+    root: Node,
+    path: &Path,
+    src: &str,
+    next_id: &mut usize,
+    symbols: &mut Vec<Symbol>,
+    is_vue_script_setup: bool,
+) -> Option<VueComponent> {
+    if path.extension().and_then(|e| e.to_str()) != Some("vue") {
+        return None;
+    }
+
+    let mut declared_props = Vec::new();
+    let mut declared_emits = Vec::new();
+    let mut explicit_name: Option<String> = None;
+    let mut anchor: Option<Node> = None;
+
+    // Options API: `export default { name: 'Foo', props: [...], emits: [...], ... }`.
+    let mut cursor = root.walk();
+    for child in root.named_children(&mut cursor) {
+        if child.kind() != "export_statement" {
+            continue;
+        }
+        let Some(value) = child.child_by_field_name("value") else {
+            continue;
+        };
+        if value.kind() != "object" {
+            continue;
+        }
+        anchor = Some(child);
+        let mut oc = value.walk();
+        for prop in value.named_children(&mut oc) {
+            if prop.kind() != "pair" {
+                continue;
+            }
+            let (Some(key), Some(prop_value)) = (
+                prop.child_by_field_name("key"),
+                prop.child_by_field_name("value"),
+            ) else {
+                continue;
+            };
+            match node_text(key, src.as_bytes()) {
+                "name" if prop_value.kind() == "string" => {
+                    explicit_name = prop_value
+                        .named_child(0)
+                        .map(|n| node_text(n, src.as_bytes()).to_string());
+                }
+                "props" => {
+                    declared_props =
+                        vue::extract_names_from_array_or_object(prop_value, src.as_bytes());
+                }
+                "emits" => {
+                    declared_emits =
+                        vue::extract_names_from_array_or_object(prop_value, src.as_bytes());
+                }
+                _ => {}
+            }
+        }
+    }
+
+    // Composition API: `<script setup>`'s `defineProps(...)`/`defineEmits(...)`
+    // compiler macros -- callable bare (no import) anywhere at the module's
+    // top level. Their mere presence, regardless of which original `<script>`
+    // block contributed these lines after SFC materialization, is what marks
+    // this file as using `<script setup>`: Vue itself only allows them there.
+    let mut cursor = root.walk();
+    for child in root.named_children(&mut cursor) {
+        let Some(call) = top_level_call(child) else {
+            continue;
+        };
+        let Some(func) = call.child_by_field_name("function") else {
+            continue;
+        };
+        if func.kind() != "identifier" {
+            continue;
+        }
+        let is_props = node_text(func, src.as_bytes()) == "defineProps";
+        let is_emits = node_text(func, src.as_bytes()) == "defineEmits";
+        if !is_props && !is_emits {
+            continue;
+        }
+        anchor.get_or_insert(child);
+        let Some(names) = call
+            .child_by_field_name("arguments")
+            .and_then(|a| a.named_child(0))
+            .map(|arg| vue::extract_names_from_array_or_object(arg, src.as_bytes()))
+        else {
+            continue;
+        };
+        if is_props {
+            declared_props = names;
+        } else {
+            declared_emits = names;
+        }
+    }
+
+    // A bare `<script setup>` with no macro calls and no Options-API object
+    // still declares a component -- Vue's own compiler doesn't need any
+    // particular statement inside the block to treat it as one, so this
+    // falls back to the whole file as the anchor.
+    let anchor = anchor.or(is_vue_script_setup.then_some(root))?;
+    let name = explicit_name.unwrap_or_else(|| vue::component_name_from_path(path));
+    let id = *next_id;
+    *next_id += 1;
+    symbols.push(symbol(
+        id,
+        &name,
+        SymbolKind::Const,
+        path,
+        anchor,
+        Environment::Universal,
+    ));
+
+    Some(VueComponent {
+        symbol_id: id,
+        name,
+        file: path.to_path_buf(),
+        line: span(anchor).start_line,
+        declared_props,
+        declared_emits,
+    })
+}
+
+/// If `node` is a top-level statement wrapping a single bare call expression
+/// -- `defineProps(...)` as its own statement, or `const props =
+/// defineProps(...)` -- return that call. Vue's `<script setup>` macros are
+/// used almost exclusively in one of these two shapes.
+fn top_level_call(node: Node) -> Option<Node> {
+    match node.kind() {
+        "expression_statement" => {
+            let expr = node.named_child(0)?;
+            (expr.kind() == "call_expression").then_some(expr)
+        }
+        "lexical_declaration" | "variable_declaration" => {
+            let mut c = node.walk();
+            for d in node.named_children(&mut c) {
+                if d.kind() != "variable_declarator" {
+                    continue;
+                }
+                if let Some(value) = d.child_by_field_name("value") {
+                    if value.kind() == "call_expression" {
+                        return Some(value);
+                    }
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+/// Recursively collect `<expr>.component('Name', LocalIdent)` calls anywhere
+/// in the file -- Vue's global component registration API, most often found
+/// nested in a bootstrap chain (`createApp(App).component('Foo',
+/// Foo).mount('#app')`), not as its own top-level statement, so this walks
+/// the whole tree rather than reusing [`top_level_call`]'s shallower search.
+/// See [`VueGlobalRegistration`] for the matching caveats.
+fn collect_vue_global_registrations(node: Node, src: &str, out: &mut Vec<VueGlobalRegistration>) {
+    if node.kind() == "call_expression" {
+        if let Some(reg) = vue_global_registration_call(node, src) {
+            out.push(reg);
+        }
+    }
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        collect_vue_global_registrations(child, src, out);
+    }
+}
+
+/// If `call` is `<expr>.component('Name', LocalIdent)` -- a member call
+/// named `component`, taking exactly a string literal and a bare identifier
+/// -- extract the registration. `LocalIdent` (not an arbitrary expression)
+/// is required since anything else can't be resolved to a component symbol
+/// without deeper flow analysis, matching this module's general "can't
+/// statically enumerate, don't guess" convention.
+fn vue_global_registration_call(call: Node, src: &str) -> Option<VueGlobalRegistration> {
+    let func = call.child_by_field_name("function")?;
+    if func.kind() != "member_expression" {
+        return None;
+    }
+    let property = func.child_by_field_name("property")?;
+    if node_text(property, src.as_bytes()) != "component" {
+        return None;
+    }
+    let args = call.child_by_field_name("arguments")?;
+    let mut ac = args.walk();
+    let named: Vec<Node> = args.named_children(&mut ac).collect();
+    let [name_arg, ident_arg] = named.as_slice() else {
+        return None;
+    };
+    if name_arg.kind() != "string" || ident_arg.kind() != "identifier" {
+        return None;
+    }
+    let tag_name = name_arg
+        .named_child(0)
+        .map(|n| node_text(n, src.as_bytes()).to_string())?;
+    Some(VueGlobalRegistration {
+        tag_name,
+        local_identifier: node_text(*ident_arg, src.as_bytes()).to_string(),
+    })
+}
+
+/// Find every top-level `const X = defineAsyncComponent(<factory>)`
+/// binding, where `<factory>` is an arrow function or function expression
+/// whose body is (or directly returns) a dynamic `import('...')` call.
+/// Unlike [`collect_vue_global_registrations`], this only looks at top-level
+/// declarations -- `defineAsyncComponent`'s whole purpose is declaring a
+/// component binding, so (unlike global registration, commonly buried in a
+/// bootstrap chain) it's never meaningfully nested.
+fn detect_vue_async_components(root: Node, src: &str) -> Vec<VueAsyncComponent> {
+    let mut out = Vec::new();
+    let mut cursor = root.walk();
+    for child in root.named_children(&mut cursor) {
+        if !matches!(child.kind(), "lexical_declaration" | "variable_declaration") {
+            continue;
+        }
+        let mut dc = child.walk();
+        for d in child.named_children(&mut dc) {
+            if d.kind() != "variable_declarator" {
+                continue;
+            }
+            let (Some(name_node), Some(value)) = (
+                d.child_by_field_name("name"),
+                d.child_by_field_name("value"),
+            ) else {
+                continue;
+            };
+            if name_node.kind() != "identifier" {
+                continue;
+            }
+            if let Some(source) = async_component_import_source(value, src) {
+                out.push(VueAsyncComponent {
+                    local_name: node_text(name_node, src.as_bytes()).to_string(),
+                    source,
+                });
+            }
+        }
+    }
+    out
+}
+
+/// If `value` is `defineAsyncComponent(<factory>)` and `<factory>`'s body
+/// is (or directly `return`s) a dynamic `import('...')` call, return the
+/// specifier. Doesn't handle `defineAsyncComponent({ loader: () => ...
+/// })`'s advanced options-object form -- only the common bare-factory
+/// shorthand, same "handle the common shape, not every shape" scoping as
+/// the rest of this module's Vue support.
+fn async_component_import_source(value: Node, src: &str) -> Option<String> {
+    if value.kind() != "call_expression" {
+        return None;
+    }
+    let func = value.child_by_field_name("function")?;
+    if func.kind() != "identifier" || node_text(func, src.as_bytes()) != "defineAsyncComponent" {
+        return None;
+    }
+    let factory = value.child_by_field_name("arguments")?.named_child(0)?;
+    if !matches!(factory.kind(), "arrow_function" | "function_expression") {
+        return None;
+    }
+    let body = factory.child_by_field_name("body")?;
+    let call = if body.kind() == "call_expression" {
+        body
+    } else if body.kind() == "statement_block" {
+        let mut bc = body.walk();
+        let mut found = None;
+        for n in body.named_children(&mut bc) {
+            if n.kind() == "return_statement" {
+                found = n.named_child(0).filter(|c| c.kind() == "call_expression");
+                break;
+            }
+        }
+        found?
+    } else {
+        return None;
+    };
+    if call.child_by_field_name("function")?.kind() != "import" {
+        return None;
+    }
+    let arg = call.child_by_field_name("arguments")?.named_child(0)?;
+    if arg.kind() != "string" {
+        return None;
+    }
+    arg.named_child(0)
+        .map(|n| node_text(n, src.as_bytes()).to_string())
 }
 
 /// Recursively collect JSX usage sites (`<Component prop={x} />`) and hook calls
