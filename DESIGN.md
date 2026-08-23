@@ -43,16 +43,33 @@ The tool operates in two modes:
 
 ## 3. Workspace layout
 
+Implemented so far:
+
 ```
 spectograph/                     (Cargo workspace)
 ├── DESIGN.md                    ← this file (single source of truth)
+├── README.md                    ← current implementation status
 ├── Cargo.toml
 ├── spectograph-core/           IR, cost model, bloat ranking, reporting
 ├── spectograph-cli/            the binary: check / fix subcommands
 ├── spectograph-analyzer/       analyzer trait + harness
 ├── spectograph-py/             Python analyzer
-├── spectograph-js/             JS analyzer
-├── spectograph-ts/             TS analyzer
+├── spectograph-js/             JS analyzer; shared React/Vue framework support
+├── spectograph-ts/             TS analyzer; Angular support; reuses JS's React/Vue support
+└── spectograph-tsserver/       shared typescript-language-server LSP client (spectograph-js + spectograph-ts)
+```
+
+Framework-specific support (React, Angular, Vue) is not a separate crate per framework —
+it's layered additively inside `spectograph-js`/`spectograph-ts` on top of the same
+symbol/reference graph the base analyzer builds, since a component is still an ordinary
+symbol and framework facts (props, template-usage edges) are just extra data collected in
+the same parse pass. See `spectograph-js/src/react.rs`, `spectograph-js/src/vue.rs`, and
+`spectograph-ts/src/angular.rs`.
+
+Not yet started — one crate each, following the same `Analyzer` trait as the languages
+above:
+
+```
 ├── spectograph-go/             Go analyzer
 ├── spectograph-rs/             Rust analyzer
 ├── spectograph-java/           Java analyzer
@@ -81,15 +98,19 @@ pub struct Program {
 pub struct Symbol {
     pub id: SymbolId,
     pub name: String,
-    pub kind: SymbolKind,     // Function, Class, Import, Export, Const, ...
+    pub kind: SymbolKind,     // Function, Class, Import, Export, Const, Type, Module
     pub file: PathBuf,
     pub span: SourceSpan,
+    pub reachable: bool,      // filled by core's reachability walk
+    pub environment: Environment,  // Universal, Node, or Browser
+    pub is_external: bool,    // third-party (e.g. node_modules) code, excluded from findings
 }
 
 pub struct Reference {
     pub from: SymbolId,
     pub to: SymbolId,
     pub kind: RefKind,        // Static, ReExport, Dynamic, Reflection, StringKeyed
+    pub environment: Environment,
 }
 ```
 
