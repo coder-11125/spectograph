@@ -122,3 +122,10 @@ is visible right next to its assertions, with no separate file to go find. `fixt
 and `fixtures/python` still hold committed directory-based fixtures from an older
 convention, exercised by `tests/fixtures.rs` in those two crates; don't add new fixtures
 there — follow the tempdir-inline pattern instead.
+
+## Do's and Dont's 
+- Always use the native Read and Write tools instead of using `grep`, `cat`, or `mkdir`
+- After every new change to the codebase, always update the `README.md`, `CLAUDE.md`, and `DESIGN.md` files to reflect the changes.
+- Use the `DESIGN.md` file as a checklist or a roadmap you can reflect to.
+- If asked to commit changes, follow the commit message conventions in `GIT.md`.
+- Never make surgical edits on any file; always read the complete file and understand the context before making one big change.
