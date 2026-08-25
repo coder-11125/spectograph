@@ -50,6 +50,10 @@ spectograph/                     (Cargo workspace)
 ├── DESIGN.md                    ← this file (single source of truth)
 ├── README.md                    ← current implementation status
 ├── Cargo.toml
+├── .gitattributes              ← marks fixtures as generated code to exclude from language stats
+├── fixtures/                   ← test fixtures (excluded from language breakdown via .gitattributes)
+│   ├── javascript/             ← JS sample projects for integration tests
+│   └── python/                 ← Python sample projects for integration tests
 ├── spectograph-core/           IR, cost model, bloat ranking, reporting
 ├── spectograph-cli/            the binary: check / fix subcommands
 ├── spectograph-analyzer/       analyzer trait + harness

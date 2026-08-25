@@ -121,7 +121,8 @@ directly in the test function, rather than committed fixture directories — the
 is visible right next to its assertions, with no separate file to go find. `fixtures/javascript`
 and `fixtures/python` still hold committed directory-based fixtures from an older
 convention, exercised by `tests/fixtures.rs` in those two crates; don't add new fixtures
-there — follow the tempdir-inline pattern instead.
+there — follow the tempdir-inline pattern instead. A `.gitattributes` file marks the
+fixtures as generated code to prevent them from affecting GitHub's language statistics.
 
 ## Do's and Dont's 
 - Always use the native Read and Write tools instead of using `grep`, `cat`, or `mkdir`

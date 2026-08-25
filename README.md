@@ -110,7 +110,9 @@ Real Python and JavaScript sample projects live under `fixtures/python/` and
   entry resolution, inheritance, dynamic-import uncertainty.
 
 Keeping these as versioned, test-backed fixtures ensures the sample code does not inflate
-the repo's language breakdown while still being load-bearing.
+the repo's language breakdown while still being load-bearing. A `.gitattributes` file marks
+the fixtures as generated code to further prevent them from affecting GitHub's language
+statistics.
 
 `spectograph-ts` has no equivalent `fixtures/typescript/` directory by design: its test
 suite (and every framework-support suite added since — React, Angular, Vue, dependency
