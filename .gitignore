@@ -4,3 +4,4 @@ Cargo.lock
 .log
 .omc/
 .claude/
+.DS_Store
