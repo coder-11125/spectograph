@@ -1,70 +1,20 @@
 //! Entrypoint detection for TypeScript projects.
 //!
-//! Narrows entrypoints down to the files a project's own tooling or convention
-//! actually treats as an entry, instead of the placeholder "every module is a
-//! potential entrypoint" default used before this landed: `package.json`'s
-//! `main`/`bin`/`browser`/`exports` fields (the format isn't TS-specific, so
-//! this reuses [`spectograph_js::entrypoints::detect_from_package_json`]
-//! rather than duplicating it), plus the conventional `index.ts(x)`/`main.ts(x)`
-//! at the project root. Only when none of those resolve to anything does it
-//! fall back to treating every non-external module as an entrypoint, so a
-//! project with no recognizable entry convention doesn't get reported as 100%
-//! bloat.
+//! The detection logic is not TypeScript-specific, so it lives in
+//! [`spectograph_js::entrypoints`] and is shared: `package.json` `main`/`module`/`bin`/
+//! `exports`/`scripts` (with `dist/` -> `src/` remapping, so a compiled `dist/index.js` finds
+//! its `src/index.ts`), HTML script tags, `angular.json`, monorepo workspace members, and
+//! framework/test/config file conventions. As there, a project with no recognizable entry at
+//! all falls back to treating every non-external module as an entrypoint, so it doesn't get
+//! reported as 100% bloat.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
-use spectograph_core::ir::{Program, SymbolId, SymbolKind};
-
-const CONVENTIONAL_ENTRY_NAMES: &[&str] = &[
-    "index.ts",
-    "index.tsx",
-    "index.mts",
-    "index.cts",
-    "main.ts",
-    "main.tsx",
-];
+use spectograph_core::ir::{Program, SymbolId};
 
 /// Detect entrypoint module symbol ids for an already-built [`Program`].
 pub fn detect_entrypoint_symbols(program: &Program, root: &Path) -> Vec<SymbolId> {
-    let module_by_file: std::collections::HashMap<&Path, SymbolId> = program
-        .symbols
-        .iter()
-        .filter(|s| s.kind == SymbolKind::Module)
-        .map(|s| (s.file.as_path(), s.id))
-        .collect();
-
-    let mut entrypoints = Vec::new();
-    let mut add = |candidate: Option<PathBuf>| {
-        let Some(id) = candidate
-            .as_deref()
-            .and_then(|p| module_by_file.get(p))
-            .copied()
-        else {
-            return;
-        };
-        if !entrypoints.contains(&id) {
-            entrypoints.push(id);
-        }
-    };
-
-    for ep in spectograph_js::entrypoints::detect_from_package_json(root).unwrap_or_default() {
-        add(crate::resolve_file_candidate(&crate::normalize_path(
-            &PathBuf::from(&ep.path),
-        )));
-    }
-    for name in CONVENTIONAL_ENTRY_NAMES {
-        add(crate::resolve_file_candidate(&root.join(name)));
-    }
-
-    if entrypoints.is_empty() {
-        for sym in &program.symbols {
-            if sym.kind == SymbolKind::Module && !sym.is_external {
-                entrypoints.push(sym.id);
-            }
-        }
-    }
-
-    entrypoints
+    spectograph_js::entrypoints::detect_entry_modules(program, root)
 }
 
 #[cfg(test)]
@@ -83,6 +33,15 @@ mod tests {
         crate::TypeScriptAnalyzer.analyze(dir.path()).unwrap()
     }
 
+    fn entry_files(program: &Program) -> Vec<String> {
+        program
+            .entrypoints
+            .iter()
+            .filter_map(|id| program.symbol(*id))
+            .map(|s| s.file.to_string_lossy().into_owned())
+            .collect()
+    }
+
     #[test]
     fn package_json_main_field_is_the_entrypoint() {
         let program = analyze(&[
@@ -90,12 +49,7 @@ mod tests {
             ("src/index.ts", "export function run(): void {}"),
             ("src/other.ts", "export function unused(): void {}"),
         ]);
-        let entry_files: Vec<String> = program
-            .entrypoints
-            .iter()
-            .filter_map(|id| program.symbol(*id))
-            .map(|s| s.file.to_string_lossy().into_owned())
-            .collect();
+        let entry_files = entry_files(&program);
         assert_eq!(entry_files.len(), 1);
         assert!(entry_files[0].ends_with("src/index.ts"));
     }
@@ -106,12 +60,7 @@ mod tests {
             ("index.ts", "export function run(): void {}"),
             ("other.ts", "export function unused(): void {}"),
         ]);
-        let entry_files: Vec<String> = program
-            .entrypoints
-            .iter()
-            .filter_map(|id| program.symbol(*id))
-            .map(|s| s.file.to_string_lossy().into_owned())
-            .collect();
+        let entry_files = entry_files(&program);
         assert_eq!(entry_files.len(), 1);
         assert!(entry_files[0].ends_with("index.ts"));
     }
@@ -131,13 +80,127 @@ mod tests {
             ("a.ts", "export function a(): void {}"),
             ("node_modules/pkg/index.ts", "export function b(): void {}"),
         ]);
-        let entry_files: Vec<String> = program
-            .entrypoints
-            .iter()
-            .filter_map(|id| program.symbol(*id))
-            .map(|s| s.file.to_string_lossy().into_owned())
-            .collect();
+        let entry_files = entry_files(&program);
         assert_eq!(entry_files.len(), 1);
         assert!(entry_files[0].ends_with("a.ts"));
+    }
+
+    #[test]
+    fn compiled_main_maps_back_to_the_ts_source() {
+        // `main` names the build artifact; the analyzed tree only has the source.
+        let program = analyze(&[
+            ("package.json", r#"{"main": "./dist/index.js"}"#),
+            ("src/index.ts", "export function run(): void {}"),
+            ("src/internal.ts", "export function helper(): void {}"),
+        ]);
+        let entry_files = entry_files(&program);
+        assert_eq!(entry_files.len(), 1);
+        assert!(entry_files[0].ends_with("src/index.ts"));
+    }
+
+    #[test]
+    fn tests_and_configs_are_roots_but_do_not_replace_the_real_entry() {
+        let program = analyze(&[
+            ("src/index.ts", "export function run(): void {}"),
+            ("src/run.test.ts", "export function t(): void {}"),
+            ("vite.config.ts", "export default {};"),
+            ("src/dead.ts", "export function dead(): void {}"),
+        ]);
+        let entry_files = entry_files(&program);
+        assert!(entry_files.iter().any(|f| f.ends_with("src/index.ts")));
+        assert!(entry_files.iter().any(|f| f.ends_with("run.test.ts")));
+        assert!(entry_files.iter().any(|f| f.ends_with("vite.config.ts")));
+        assert!(!entry_files.iter().any(|f| f.ends_with("dead.ts")));
+    }
+
+    #[test]
+    fn only_tests_present_does_not_make_the_rest_of_the_project_dead() {
+        // No primary entry convention anywhere: every module stays a root.
+        let program = analyze(&[
+            ("lib/a.ts", "export function a(): void {}"),
+            ("lib/a.test.ts", "export function t(): void {}"),
+        ]);
+        assert_eq!(program.entrypoints.len(), 2);
+    }
+
+    #[test]
+    fn next_app_router_routes_are_entrypoints() {
+        let program = analyze(&[
+            ("package.json", r#"{"dependencies": {"next": "14.0.0"}}"#),
+            (
+                "app/page.tsx",
+                "export default function Page() { return null; }",
+            ),
+            (
+                "app/dashboard/layout.tsx",
+                "export default function L() { return null; }",
+            ),
+            (
+                "components/unused.tsx",
+                "export function Unused() { return null; }",
+            ),
+        ]);
+        let entry_files = entry_files(&program);
+        assert!(entry_files.iter().any(|f| f.ends_with("app/page.tsx")));
+        assert!(entry_files
+            .iter()
+            .any(|f| f.ends_with("dashboard/layout.tsx")));
+        assert!(!entry_files.iter().any(|f| f.ends_with("unused.tsx")));
+    }
+
+    #[test]
+    fn vite_index_html_module_script_is_the_entrypoint() {
+        let program = analyze(&[
+            (
+                "index.html",
+                r#"<html><body><script type="module" src="/src/bootstrap.tsx"></script></body></html>"#,
+            ),
+            ("src/bootstrap.tsx", "export const x = 1;"),
+            ("src/dead.tsx", "export const y = 2;"),
+        ]);
+        let entry_files = entry_files(&program);
+        assert_eq!(entry_files.len(), 1);
+        assert!(entry_files[0].ends_with("bootstrap.tsx"));
+    }
+
+    #[test]
+    fn npm_scripts_name_entry_files() {
+        let program = analyze(&[
+            (
+                "package.json",
+                r#"{"scripts": {"start": "tsx watch src/server.ts"}}"#,
+            ),
+            ("src/server.ts", "export const s = 1;"),
+            ("src/dead.ts", "export const d = 2;"),
+        ]);
+        let entry_files = entry_files(&program);
+        assert!(entry_files.iter().any(|f| f.ends_with("src/server.ts")));
+        assert!(!entry_files.iter().any(|f| f.ends_with("dead.ts")));
+    }
+
+    #[test]
+    fn monorepo_packages_each_get_their_own_roots() {
+        let program = analyze(&[
+            ("package.json", r#"{"name": "root", "private": true}"#),
+            (
+                "packages/a/package.json",
+                r#"{"name": "@x/a", "main": "dist/index.js"}"#,
+            ),
+            ("packages/a/src/index.ts", "export const a = 1;"),
+            ("packages/a/src/dead.ts", "export const d = 1;"),
+            (
+                "packages/b/package.json",
+                r#"{"name": "@x/b", "main": "lib/main.js"}"#,
+            ),
+            ("packages/b/src/main.ts", "export const b = 1;"),
+        ]);
+        let entry_files = entry_files(&program);
+        assert!(entry_files
+            .iter()
+            .any(|f| f.ends_with("packages/a/src/index.ts")));
+        assert!(entry_files
+            .iter()
+            .any(|f| f.ends_with("packages/b/src/main.ts")));
+        assert!(!entry_files.iter().any(|f| f.ends_with("a/src/dead.ts")));
     }
 }

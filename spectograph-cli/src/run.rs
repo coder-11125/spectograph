@@ -1,52 +1,89 @@
 //! Command execution for the CLI.
 
-use std::path::Path;
+use std::cmp::Reverse;
+use std::path::{Component, Path};
+use std::process::ExitCode;
 
 use spectograph_analyzer::Analyzer;
 use spectograph_core::analysis::{self, BloatTier};
-use spectograph_core::cost::CostSource;
-use spectograph_core::ir::Language;
+use spectograph_core::diagnostic::Diagnostic;
+use spectograph_core::ir::{Language, Program};
 use spectograph_core::report::{self, JsonReport};
 use spectograph_js::JavaScriptAnalyzer;
 use spectograph_py::PythonAnalyzer;
 use spectograph_ts::TypeScriptAnalyzer;
 
-use crate::cli::{Cli, Command, FixArgs};
+use crate::cli::{CheckArgs, Cli, Command, FixArgs};
 
-/// Map a language name to an analyzer implementation.
-fn analyzer_for(lang: &str) -> Result<Box<dyn Analyzer>, String> {
-    match lang {
-        "python" | "py" => Ok(Box::new(PythonAnalyzer)),
-        "javascript" | "js" => Ok(Box::new(JavaScriptAnalyzer)),
-        "typescript" | "ts" => Ok(Box::new(TypeScriptAnalyzer)),
+/// The languages with a working analyzer, in tie-break order (most specific first).
+const IMPLEMENTED: [Language; 3] = [Language::TypeScript, Language::JavaScript, Language::Python];
+
+/// Map a `--language` value to a [`Language`].
+fn parse_language(name: &str) -> Result<Language, String> {
+    match name {
+        "python" | "py" => Ok(Language::Python),
+        "javascript" | "js" => Ok(Language::JavaScript),
+        "typescript" | "ts" => Ok(Language::TypeScript),
         other => Err(format!(
             "unsupported language '{other}'. Implemented: python, javascript, typescript"
         )),
     }
 }
 
-/// Detect a supported language from the root directory by its file extensions.
-fn detect_language(root: &Path) -> Option<Language> {
-    let candidates = [
-        Language::Python,
-        Language::JavaScript,
-        Language::TypeScript,
-        Language::Go,
-        Language::Rust,
-        Language::Java,
-        Language::Kotlin,
-        Language::C,
-        Language::Cpp,
-        Language::Ruby,
-    ];
-    for lang in candidates {
-        if let Ok(files) = spectograph_analyzer::discover::discover_files(root, lang) {
-            if !files.is_empty() {
-                return Some(lang);
-            }
+fn analyzer_for(lang: Language) -> Box<dyn Analyzer> {
+    match lang {
+        Language::Python => Box::new(PythonAnalyzer),
+        Language::JavaScript => Box::new(JavaScriptAnalyzer),
+        Language::TypeScript => Box::new(TypeScriptAnalyzer),
+        other => unreachable!("{other:?} has no analyzer; callers only pass IMPLEMENTED languages"),
+    }
+}
+
+/// True for paths inside dependency or virtual-environment directories, which shouldn't
+/// influence which language a project "is".
+fn is_vendored(path: &Path) -> bool {
+    path.components().any(|c| {
+        matches!(
+            c,
+            Component::Normal(n)
+                if n == "node_modules" || n == "site-packages" || n == "venv" || n == "__pycache__"
+        )
+    })
+}
+
+/// Pick the language with the most source files under `root`. The first language found is
+/// *not* good enough: a TypeScript app routinely contains a few `.js` config files, and a
+/// JavaScript app a Python helper script, and analyzing the wrong one reports nonsense.
+fn detect_language(root: &Path) -> Result<Language, String> {
+    let mut counts: Vec<(Language, usize)> = Vec::new();
+    for lang in IMPLEMENTED {
+        let files = spectograph_analyzer::discover::discover_files(root, lang)
+            .map_err(|e| format!("could not scan {}: {e}", root.display()))?;
+        let n = files.iter().filter(|f| !is_vendored(f)).count();
+        if n > 0 {
+            counts.push((lang, n));
         }
     }
-    None
+    // Stable sort keeps IMPLEMENTED's order among equal counts.
+    counts.sort_by_key(|&(_, n)| Reverse(n));
+    let Some(&(chosen, _)) = counts.first() else {
+        return Err(format!(
+            "could not detect a supported language (python, javascript, typescript) under {}",
+            root.display()
+        ));
+    };
+    if counts.len() > 1 {
+        let others: Vec<String> = counts[1..]
+            .iter()
+            .map(|(l, n)| format!("{n} {} file(s)", l.name()))
+            .collect();
+        eprintln!(
+            "note: analyzing {} (the most files); also found {}. Use --language to choose.",
+            chosen.name(),
+            others.join(", ")
+        );
+    }
+    Ok(chosen)
 }
 
 fn tier_from_str(s: &str) -> Result<BloatTier, String> {
@@ -60,79 +97,71 @@ fn tier_from_str(s: &str) -> Result<BloatTier, String> {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn run_check(
-    root: &Path,
-    format: &str,
-    language: Option<&str>,
-    fail_on: &str,
-    resolution: &str,
-    pyright_executable: Option<&str>,
-    pyright_timeout: u64,
-    tsserver_executable: Option<&str>,
-    tsserver_timeout: u64,
-) -> Result<i32, String> {
-    let lang = match language {
-        Some(l) => l.to_string(),
-        None => detect_language(root)
-            .ok_or_else(|| "could not detect a supported language in the root".to_string())?
-            .name()
-            .to_string(),
+/// Run the right analyzer/resolution combination, returning the program plus any
+/// framework diagnostics collected in the same pass.
+fn analyze_program(lang: Language, args: &CheckArgs) -> Result<(Program, Vec<Diagnostic>), String> {
+    let root = args.root.as_path();
+    let failed = |e: spectograph_analyzer::AnalyzeError| format!("analysis failed: {e}");
+
+    match (lang, args.resolution.as_str()) {
+        (Language::Python, "pyright") => {
+            // Type-aware resolution via basedpyright.
+            let program = PythonAnalyzer
+                .analyze_with_resolution(
+                    root,
+                    spectograph_py::ResolutionMode::Pyright,
+                    args.pyright_executable.as_deref(),
+                    args.pyright_timeout,
+                )
+                .map_err(failed)?;
+            Ok((program, Vec::new()))
+        }
+        (Language::TypeScript, "tsserver") => TypeScriptAnalyzer
+            .analyze_full(
+                root,
+                spectograph_ts::ResolutionMode::Tsserver,
+                args.tsserver_executable.as_deref(),
+                args.tsserver_timeout,
+            )
+            .map_err(failed),
+        (Language::JavaScript, "tsserver") => JavaScriptAnalyzer
+            .analyze_full(
+                root,
+                spectograph_js::ResolutionMode::Tsserver,
+                args.tsserver_executable.as_deref(),
+                args.tsserver_timeout,
+            )
+            .map_err(failed),
+        (_, "pyright") => Err("--resolution pyright is only supported for python currently".into()),
+        (_, "tsserver") => Err(
+            "--resolution tsserver is only supported for typescript and javascript currently"
+                .into(),
+        ),
+        _ => analyzer_for(lang)
+            .analyze_with_diagnostics(root)
+            .map_err(failed),
+    }
+}
+
+fn run_check(args: &CheckArgs) -> Result<i32, String> {
+    if !args.root.is_dir() {
+        return Err(format!("{} is not a directory", args.root.display()));
+    }
+
+    let lang = match args.language.as_deref() {
+        Some(name) => parse_language(name)?,
+        None => detect_language(&args.root)?,
     };
 
-    let analyzer = analyzer_for(&lang)?;
-    let mut program = if lang.starts_with("python") && resolution == "pyright" {
-        // Type-aware resolution via basedpyright.
-        let py = PythonAnalyzer;
-        py.analyze_with_resolution(
-            root,
-            spectograph_py::ResolutionMode::Pyright,
-            pyright_executable,
-            pyright_timeout,
-        )
-        .map_err(|e| format!("analysis failed: {e}"))?
-    } else if lang.starts_with("typescript") && resolution == "tsserver" {
-        // Type-aware resolution via typescript-language-server.
-        let ts = TypeScriptAnalyzer;
-        ts.analyze_with_resolution(
-            root,
-            spectograph_ts::ResolutionMode::Tsserver,
-            tsserver_executable,
-            tsserver_timeout,
-        )
-        .map_err(|e| format!("analysis failed: {e}"))?
-    } else if lang.starts_with("javascript") && resolution == "tsserver" {
-        // Type-aware resolution via typescript-language-server (allowJs/checkJs).
-        let js = JavaScriptAnalyzer;
-        js.analyze_with_resolution(
-            root,
-            spectograph_js::ResolutionMode::Tsserver,
-            tsserver_executable,
-            tsserver_timeout,
-        )
-        .map_err(|e| format!("analysis failed: {e}"))?
-    } else {
-        if resolution == "pyright" {
-            return Err("--resolution pyright is only supported for python currently".to_string());
-        }
-        if resolution == "tsserver" {
-            return Err(
-                "--resolution tsserver is only supported for typescript and javascript currently"
-                    .to_string(),
-            );
-        }
-        analyzer
-            .analyze(root)
-            .map_err(|e| format!("analysis failed: {e}"))?
-    };
+    let (mut program, diagnostics) = analyze_program(lang, args)?;
 
-    // Cost model: static estimate for the vertical slice (no workload yet).
-    let model = analyzer.cost_model(&program);
-    let _ = CostSource::Estimated;
+    // Cost model: static estimate (no runtime workload yet).
+    let model = analyzer_for(lang).cost_model(&program);
 
-    let report = analysis::analyze(&mut program, &model);
+    let mut report = analysis::analyze(&mut program, &model);
+    report.diagnostics = diagnostics;
 
-    match format {
+    match args.format.as_str() {
         "json" => {
             let json = JsonReport::from_report(&report);
             println!(
@@ -140,42 +169,26 @@ fn run_check(
                 serde_json::to_string_pretty(&json).map_err(|e| e.to_string())?
             );
         }
-        _ => {
-            print!("{}", report::render_human(&report, false));
-        }
+        _ => print!("{}", report::render_human(&report)),
     }
 
-    let min_tier = tier_from_str(fail_on)?;
-    let violated = report.findings.iter().any(|f| f.tier >= min_tier);
+    let min_tier = tier_from_str(&args.fail_on)?;
+    let violated = report.findings.iter().any(|f| f.tier <= min_tier)
+        || (args.fail_on_diagnostics && !report.diagnostics.is_empty());
     Ok(if violated { 1 } else { 0 })
 }
 
 fn run_fix(args: FixArgs) -> Result<i32, String> {
-    // `fix` is stubbed in this vertical slice. The agent loop + worktree isolation
-    // and the smoke/CI gate land in a later milestone (see DESIGN.md §6).
+    // `fix` (agent loop + worktree isolation + smoke/CI gate, DESIGN.md §6) isn't built yet.
+    // Failing loudly beats exiting 0, which a CI step would read as "fixed".
     let _ = args;
-    println!(
-        "spectograph fix: not yet implemented (agent loop + worktree isolation are a later milestone)."
-    );
-    Ok(0)
+    Err("`spectograph fix` is not implemented yet; use `spectograph check`".to_string())
 }
 
-pub fn run(cli: Cli) -> Result<std::process::ExitCode, String> {
+pub fn run(cli: Cli) -> Result<ExitCode, String> {
     let code = match cli.command {
-        Command::Check(args) => run_check(
-            &args.root,
-            &args.format,
-            args.language.as_deref(),
-            &args.fail_on,
-            &args.resolution,
-            args.pyright_executable.as_deref(),
-            args.pyright_timeout,
-            args.tsserver_executable.as_deref(),
-            args.tsserver_timeout,
-        )?,
+        Command::Check(args) => run_check(&args)?,
         Command::Fix(args) => run_fix(args)?,
     };
-
-    use std::process::ExitCode;
     Ok(ExitCode::from(code as u8))
 }

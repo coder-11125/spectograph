@@ -1,4 +1,7 @@
 //! Command-line interface definitions.
+//!
+//! Exit codes (also documented in `README.md`): `0` clean, `1` findings at or above
+//! `--fail-on` (or diagnostics with `--fail-on-diagnostics`), `2` usage or analysis error.
 
 use std::path::PathBuf;
 
@@ -15,7 +18,7 @@ pub struct Cli {
 pub enum Command {
     /// Read-only: build the cost/usage model and report bloat.
     Check(CheckArgs),
-    /// Mutating: refactor the codebase lean in an isolated worktree (stubbed).
+    /// Mutating: refactor the codebase lean in an isolated worktree (not implemented yet).
     Fix(FixArgs),
 }
 
@@ -29,13 +32,19 @@ pub struct CheckArgs {
     #[arg(long, default_value = "human", value_parser = ["human", "json"])]
     pub format: String,
 
-    /// Language to analyze (e.g. python). If omitted, auto-detect from the root.
-    #[arg(long)]
+    /// Language to analyze. If omitted, the language with the most source files under the
+    /// root is analyzed (and a note is printed to stderr if others are present).
+    #[arg(long, value_parser = ["python", "py", "javascript", "js", "typescript", "ts"])]
     pub language: Option<String>,
 
-    /// Fail (nonzero exit) only for this tier or stricter: guaranteed, probable, high_cost.
-    #[arg(long, default_value = "guaranteed")]
+    /// Fail (nonzero exit) only for this tier or stricter.
+    #[arg(long, default_value = "guaranteed", value_parser = ["guaranteed", "probable", "high_cost"])]
     pub fail_on: String,
+
+    /// Also fail (exit 1) when framework diagnostics (React/Angular/Vue prop and binding
+    /// mismatches) are reported. Off by default: they are informational.
+    #[arg(long)]
+    pub fail_on_diagnostics: bool,
 
     /// Reference-resolution backend: static (default), pyright (type-aware
     /// Python), or tsserver (type-aware TypeScript/JavaScript).

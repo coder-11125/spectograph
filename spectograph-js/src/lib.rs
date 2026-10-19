@@ -2,9 +2,17 @@
 //!
 //! Parses JavaScript source with tree-sitter into the shared [`Program`] IR.
 
+pub mod aliases;
+pub mod diagnostics;
 pub mod entrypoints;
+pub mod exports;
+pub mod implicit;
+pub mod jsonc;
 pub mod parse;
+pub mod pathutil;
 pub mod react;
+pub mod template_bindings;
+pub mod tsconfig;
 pub mod vue;
 
 /// The `typescript-language-server`-backed type-aware resolution backend
@@ -16,10 +24,14 @@ pub use spectograph_tsserver as tsserver;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
-use entrypoints::detect_entrypoint_symbols;
+use aliases::ProjectResolver;
+use entrypoints::detect_entries;
+use exports::ExportedByModule;
 use parse::parse_file;
+use pathutil::normalize_path;
 use serde_json::Value;
 use spectograph_analyzer::{discover, AnalyzeError, Analyzer};
+use spectograph_core::diagnostic::Diagnostic;
 use spectograph_core::ir::{
     Environment, Language, Program, RefKind, Reference, SymbolId, SymbolKind,
 };
@@ -197,26 +209,19 @@ fn read_browser_map(root: &Path) -> HashMap<String, Value> {
         .unwrap_or_default()
 }
 
-/// Collapse `.`/`..` components so a joined path's string form matches the plain
-/// paths [`spectograph_analyzer::discover::discover_files`] produces. `PathBuf::join`
-/// preserves a leading `./` verbatim (e.g. `base/./client.js`), which otherwise never
-/// string-equals the canonical `base/client.js` key used for module lookups.
-fn normalize_path(path: &Path) -> PathBuf {
-    let mut result = PathBuf::new();
-    for component in path.components() {
-        match component {
-            std::path::Component::CurDir => {}
-            std::path::Component::ParentDir if result.file_name().is_some() => {
-                result.pop();
-            }
-            other => result.push(other),
-        }
-    }
-    result
+/// Read a source file as text, replacing invalid UTF-8 rather than failing: a single
+/// latin-1 or binary-ish file in a repo (vendored libraries, fixtures) must not abort the
+/// analysis of everything else.
+fn read_source(path: &Path) -> std::io::Result<String> {
+    std::fs::read(path).map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
 }
 
-/// Try `path` as-is, then `path.js`, then `path/index.js` (Node.js's extension and
-/// directory-index resolution rules), returning the first that exists as a file.
+/// Extensions a bare `require('./x')`/`import './x'` may omit.
+const SOURCE_EXTENSIONS: &[&str] = &["js", "jsx", "mjs", "cjs", "vue"];
+
+/// Try `path` as-is, then with each JS source extension, then as a directory's index file
+/// (Node.js's extension and directory-index resolution rules), returning the first that
+/// exists as a file.
 fn resolve_file_candidate(path: &Path) -> Option<PathBuf> {
     if path.is_file() {
         return Some(path.to_path_buf());
@@ -228,15 +233,15 @@ fn resolve_file_candidate(path: &Path) -> Option<PathBuf> {
     // `./foo.test` -> `foo.test.js`, ...). `with_extension("js")` on
     // `foo.model` produces `foo.js`, not `foo.model.js`, so the guessed
     // candidate never exists and resolution fails outright.
-    for ext in ["js", "vue"] {
+    for ext in SOURCE_EXTENSIONS {
         let candidate = PathBuf::from(format!("{}.{ext}", path.to_string_lossy()));
         if candidate.is_file() {
             return Some(candidate);
         }
     }
     if path.is_dir() {
-        for name in ["index.js", "index.vue"] {
-            let index_path = path.join(name);
+        for ext in SOURCE_EXTENSIONS {
+            let index_path = path.join(format!("index.{ext}"));
             if index_path.is_file() {
                 return Some(index_path);
             }
@@ -292,15 +297,18 @@ fn resolve_package_entry(pkg_dir: &Path) -> Option<PathBuf> {
 }
 
 /// Node.js-style module resolution helper, with optional bundler `browser`-field
-/// remapping. Returns the resolved file path plus the [`Environment`] the resolution
-/// implies (`Browser` only when a `browser` field remap was applied).
+/// remapping and project-level aliases (`jsconfig` `paths`, `package.json` `imports`,
+/// workspace packages, `@/`-style conventions). Returns the resolved file path plus the
+/// [`Environment`] the resolution implies (`Browser` only when a `browser` field remap was
+/// applied).
 fn resolve_module_path(
     base: &Path,
     module_path: &str,
     browser_map: &HashMap<String, Value>,
+    resolver: &ProjectResolver,
 ) -> (PathBuf, Environment) {
     if let Some(mapped) = browser_map.get(module_path).and_then(|v| v.as_str()) {
-        let (resolved, _) = resolve_module_path(base, mapped, &HashMap::new());
+        let (resolved, _) = resolve_module_path(base, mapped, &HashMap::new(), resolver);
         return (resolved, Environment::Browser);
     }
 
@@ -316,6 +324,14 @@ fn resolve_module_path(
             return (resolved, Environment::Universal);
         }
         return (path, Environment::Universal);
+    }
+
+    // Project aliases and workspace packages win over `node_modules`, the way a bundler
+    // configured with them would resolve.
+    for candidate in resolver.candidates(module_path) {
+        if let Some(resolved) = resolve_file_candidate(&candidate) {
+            return (resolved, Environment::Universal);
+        }
     }
 
     // Handle node_modules packages (non-relative imports), including package
@@ -395,6 +411,28 @@ fn build_vue_scope_maps(program: &Program, parsed: &[(String, parse::FileResult)
         .filter_map(|(_p, r)| r.vue_component.as_ref().map(|c| c.symbol_id))
         .collect();
 
+    // Nothing to match against: every map below would come out empty, and skipping the
+    // edge indexing keeps non-Vue projects from paying for it.
+    if vue_component_ids.is_empty() {
+        return (HashMap::new(), HashMap::new(), HashMap::new());
+    }
+
+    // First edge of each kind per source symbol, indexed once instead of rescanning every
+    // reference for every import.
+    let mut first_reexport: HashMap<SymbolId, SymbolId> = HashMap::new();
+    let mut first_dynamic: HashMap<SymbolId, SymbolId> = HashMap::new();
+    for r in &program.references {
+        match r.kind {
+            RefKind::ReExport => {
+                first_reexport.entry(r.from).or_insert(r.to);
+            }
+            RefKind::Dynamic => {
+                first_dynamic.entry(r.from).or_insert(r.to);
+            }
+            _ => {}
+        }
+    }
+
     // (file, bound local name) -> the Vue component symbol that name
     // resolves to, for every file's own imports and
     // `defineAsyncComponent` bindings -- covers `<script setup>`'s implicit
@@ -404,12 +442,7 @@ fn build_vue_scope_maps(program: &Program, parsed: &[(String, parse::FileResult)
     let mut local_scope: HashMap<(PathBuf, String), SymbolId> = HashMap::new();
     for (path, result) in parsed {
         for imp in &result.imports {
-            let target = program
-                .references
-                .iter()
-                .find(|r| r.from == imp.symbol_id && r.kind == RefKind::ReExport)
-                .map(|r| r.to);
-            if let Some(target) = target {
+            if let Some(&target) = first_reexport.get(&imp.symbol_id) {
                 if vue_component_ids.contains(&target) {
                     local_scope.insert(
                         (PathBuf::from(path.as_str()), imp.local_name.clone()),
@@ -427,12 +460,7 @@ fn build_vue_scope_maps(program: &Program, parsed: &[(String, parse::FileResult)
             else {
                 continue;
             };
-            let target = program
-                .references
-                .iter()
-                .find(|r| r.from == const_id && r.kind == RefKind::Dynamic)
-                .map(|r| r.to);
-            if let Some(target) = target {
+            if let Some(&target) = first_dynamic.get(&const_id) {
                 if vue_component_ids.contains(&target) {
                     local_scope.insert(
                         (PathBuf::from(path.as_str()), reg.local_name.clone()),
@@ -469,26 +497,98 @@ fn build_vue_scope_maps(program: &Program, parsed: &[(String, parse::FileResult)
     (local_scope, global_components, canonical_names)
 }
 
+/// Every Vue template prop/emit mismatch in an already-analyzed project. Rebuilds the same
+/// scope maps the reachability-edge pass in `analyze_impl` uses (see `build_vue_scope_maps`),
+/// plus a fresh read of each `.vue` file's `<template>` block -- not persisted in
+/// `analyze_impl`'s own return value, since nothing else needs it once the edges are built.
+pub(crate) fn vue_mismatches(
+    program: &Program,
+    parsed: &[(String, parse::FileResult)],
+    root: &Path,
+) -> Result<Vec<vue::VueBindingMismatch>, AnalyzeError> {
+    if parsed.iter().all(|(_p, r)| r.vue_component.is_none()) {
+        return Ok(Vec::new());
+    }
+    let (local_scope, global_components, canonical_names) = build_vue_scope_maps(program, parsed);
+
+    let using_symbol_by_path: HashMap<PathBuf, SymbolId> = parsed
+        .iter()
+        .map(|(path, result)| {
+            let using = result
+                .vue_component
+                .as_ref()
+                .map(|c| c.symbol_id)
+                .unwrap_or(result.module_id);
+            (PathBuf::from(path.as_str()), using)
+        })
+        .collect();
+
+    let mut sites: Vec<vue::TemplateUsageSite> = Vec::new();
+    for path in vue::discover_vue_files(root)? {
+        let src = read_source(&path)?;
+        let sfc = vue::parse_sfc(&src);
+        let (Some(template), Some(&using_symbol)) = (sfc.template, using_symbol_by_path.get(&path))
+        else {
+            continue;
+        };
+        sites.push(vue::TemplateUsageSite {
+            file: path,
+            template: template.content,
+            using_symbol,
+        });
+    }
+
+    let components: Vec<vue::VueComponent> = parsed
+        .iter()
+        .filter_map(|(_p, r)| r.vue_component.clone())
+        .collect();
+
+    Ok(vue::find_binding_mismatches(
+        &components,
+        &sites,
+        &local_scope,
+        &global_components,
+        &canonical_names,
+    ))
+}
+
+/// Collects references while dropping exact duplicates (the same member accessed a hundred
+/// times in one function is one edge).
+struct EdgeSink<'a> {
+    references: &'a mut Vec<Reference>,
+    seen: HashSet<(SymbolId, SymbolId, RefKind)>,
+}
+
+impl EdgeSink<'_> {
+    fn push(&mut self, reference: Reference) {
+        if self
+            .seen
+            .insert((reference.from, reference.to, reference.kind))
+        {
+            self.references.push(reference);
+        }
+    }
+}
+
 impl JavaScriptAnalyzer {
-    /// Analyze with a resolution backend. `Static` is equivalent to
-    /// [`Analyzer::analyze`].
-    pub fn analyze_with_resolution(
+    /// Swap the static call-graph edges for type-aware `typescript-language-server` ones.
+    fn apply_resolution(
         &self,
         root: &Path,
+        program: &mut Program,
         resolution: ResolutionMode,
         tsserver_executable: Option<&str>,
         timeout_ms: u64,
-    ) -> Result<Program, AnalyzeError> {
-        let mut program = Analyzer::analyze(self, root)?;
+    ) -> Result<(), AnalyzeError> {
         if resolution == ResolutionMode::Static {
-            return Ok(program);
+            return Ok(());
         }
         let executable = tsserver_executable
             .map(str::to_string)
             .unwrap_or_else(|| "typescript-language-server".to_string());
         let edges = tsserver::resolve_program_edges(
             root,
-            &program,
+            program,
             Language::JavaScript,
             &executable,
             timeout_ms,
@@ -519,7 +619,49 @@ impl JavaScriptAnalyzer {
                 environment: Environment::Universal,
             });
         }
+        Ok(())
+    }
+
+    /// Analyze with a resolution backend. `Static` is equivalent to
+    /// [`Analyzer::analyze`].
+    pub fn analyze_with_resolution(
+        &self,
+        root: &Path,
+        resolution: ResolutionMode,
+        tsserver_executable: Option<&str>,
+        timeout_ms: u64,
+    ) -> Result<Program, AnalyzeError> {
+        let mut program = Analyzer::analyze(self, root)?;
+        self.apply_resolution(
+            root,
+            &mut program,
+            resolution,
+            tsserver_executable,
+            timeout_ms,
+        )?;
         Ok(program)
+    }
+
+    /// The full `check` pipeline for JavaScript: the [`Program`], framework diagnostics
+    /// (React prop mismatches, Vue prop/emit mismatches) from the same parse pass, and the
+    /// optional type-aware resolution swap.
+    pub fn analyze_full(
+        &self,
+        root: &Path,
+        resolution: ResolutionMode,
+        tsserver_executable: Option<&str>,
+        timeout_ms: u64,
+    ) -> Result<(Program, Vec<Diagnostic>), AnalyzeError> {
+        let (mut program, parsed) = self.analyze_impl(root)?;
+        let diagnostics = diagnostics::collect(&program, &parsed, root)?;
+        self.apply_resolution(
+            root,
+            &mut program,
+            resolution,
+            tsserver_executable,
+            timeout_ms,
+        )?;
+        Ok((program, diagnostics))
     }
 
     /// Like [`Analyzer::analyze`], but also returns React component/prop/hook
@@ -552,59 +694,13 @@ impl JavaScriptAnalyzer {
     /// Like [`Analyzer::analyze`], but also returns every Vue template
     /// prop/emit mismatch found -- a `<user-card :extra="1">` (or `@bogus=`)
     /// usage passing a binding the target component doesn't declare via
-    /// `props`/`defineProps`/`emits`/`defineEmits`. Rebuilds the same scope
-    /// maps the reachability-edge pass in `analyze_impl` uses (see
-    /// `build_vue_scope_maps`), plus a fresh read of each `.vue` file's
-    /// `<template>` block -- not persisted in `analyze_impl`'s own return
-    /// value, since nothing else needs it once the edges are built.
+    /// `props`/`defineProps`/`emits`/`defineEmits`. See `vue_mismatches`.
     pub fn analyze_vue_mismatches(
         &self,
         root: &Path,
     ) -> Result<(Program, Vec<vue::VueBindingMismatch>), AnalyzeError> {
         let (program, parsed) = self.analyze_impl(root)?;
-        let (local_scope, global_components, canonical_names) =
-            build_vue_scope_maps(&program, &parsed);
-
-        let using_symbol_by_path: HashMap<PathBuf, SymbolId> = parsed
-            .iter()
-            .map(|(path, result)| {
-                let using = result
-                    .vue_component
-                    .as_ref()
-                    .map(|c| c.symbol_id)
-                    .unwrap_or(result.module_id);
-                (PathBuf::from(path.as_str()), using)
-            })
-            .collect();
-
-        let mut sites: Vec<vue::TemplateUsageSite> = Vec::new();
-        for path in vue::discover_vue_files(root)? {
-            let src = std::fs::read_to_string(&path)?;
-            let sfc = vue::parse_sfc(&src);
-            let (Some(template), Some(&using_symbol)) =
-                (sfc.template, using_symbol_by_path.get(&path))
-            else {
-                continue;
-            };
-            sites.push(vue::TemplateUsageSite {
-                file: path,
-                template: template.content,
-                using_symbol,
-            });
-        }
-
-        let components: Vec<vue::VueComponent> = parsed
-            .iter()
-            .filter_map(|(_p, r)| r.vue_component.clone())
-            .collect();
-
-        let mismatches = vue::find_binding_mismatches(
-            &components,
-            &sites,
-            &local_scope,
-            &global_components,
-            &canonical_names,
-        );
+        let mismatches = vue_mismatches(&program, &parsed, root)?;
         Ok((program, mismatches))
     }
 
@@ -613,6 +709,7 @@ impl JavaScriptAnalyzer {
         root: &Path,
     ) -> Result<(Program, Vec<(String, parse::FileResult)>), AnalyzeError> {
         let files = discover::discover_files(root, Language::JavaScript)?;
+        let resolver = ProjectResolver::load(root);
 
         // `.vue` Single-File Components aren't owned by `Language::JavaScript`'s
         // extension list (see `vue::discover_vue_files`'s doc comment) -- only
@@ -624,7 +721,7 @@ impl JavaScriptAnalyzer {
         // regular file below with no further changes.
         let mut file_sources: Vec<(PathBuf, String)> = Vec::new();
         for path in &files {
-            let src = std::fs::read_to_string(path)?;
+            let src = read_source(path)?;
             file_sources.push((path.clone(), src));
         }
         // Captured alongside `file_sources` for the Vue template-usage
@@ -638,7 +735,7 @@ impl JavaScriptAnalyzer {
         // indistinguishable from a plain non-Vue file once materialized.
         let mut vue_script_setup_files: HashSet<PathBuf> = HashSet::new();
         for path in vue::discover_vue_files(root)? {
-            let src = std::fs::read_to_string(&path)?;
+            let src = read_source(&path)?;
             let sfc = vue::parse_sfc(&src);
             if let Some((materialized, vue::ScriptLang::JavaScript)) = vue::materialize_script(&sfc)
             {
@@ -665,12 +762,9 @@ impl JavaScriptAnalyzer {
         };
 
         let mut next_id: usize = 0;
-        // Global name -> symbol id
+        // Global name -> symbol id (first definition wins), used to resolve names no scope
+        // knows (the uncertain, by-name fallback).
         let mut global_names: HashMap<String, SymbolId> = HashMap::new();
-        // Definition index (Function/Class/Const) by name, for import resolution.
-        let mut def_index: HashMap<String, SymbolId> = HashMap::new();
-        // Track each file's module id
-        let mut file_module: HashMap<String, SymbolId> = HashMap::new();
         // Bundler `browser` field remapping, applied during module resolution below.
         let browser_map = read_browser_map(root);
 
@@ -688,30 +782,24 @@ impl JavaScriptAnalyzer {
                 vue_script_setup_files.contains(path),
             );
 
-            // Index symbols for resolution
             for sym in &result.symbols {
                 if sym.kind != SymbolKind::Module {
                     // First definition wins for vertical slice
                     global_names.entry(sym.name.clone()).or_insert(sym.id);
-                    if matches!(
-                        sym.kind,
-                        SymbolKind::Function | SymbolKind::Class | SymbolKind::Const
-                    ) {
-                        def_index.entry(sym.name.clone()).or_insert(sym.id);
-                    }
                 }
             }
             program.symbols.extend(result.symbols.clone());
             parsed.push((path.to_string_lossy().into_owned(), result));
-            file_module.insert(path.to_string_lossy().into_owned(), module_id);
         }
 
-        // Build module path index: file path -> module symbol id
+        // Build module path index: normalized file path -> module symbol id. Normalized so
+        // `./src/a.js` (what a walk of `.` yields) and `src/a.js` (what resolution produces)
+        // are the same key.
         let module_paths: HashMap<String, SymbolId> = program
             .symbols
             .iter()
             .filter(|s| s.kind == SymbolKind::Module)
-            .map(|s| (s.file.to_string_lossy().into_owned(), s.id))
+            .map(|s| (normalize_path(&s.file).to_string_lossy().into_owned(), s.id))
             .collect();
 
         // Build name_in_module index: (module_id, name) -> symbol_id
@@ -726,20 +814,68 @@ impl JavaScriptAnalyzer {
             }
         }
 
+        // What each module exposes, and which symbols a property access like `.run` can name.
+        let exported_by_module: ExportedByModule = parsed
+            .iter()
+            .filter(|(_, r)| !r.exported.is_empty())
+            .map(|(_, r)| (r.module_id, r.exported.clone()))
+            .collect();
+        let members_by_name = exports::member_index(&program, &exported_by_module);
+
+        let mut edges = EdgeSink {
+            references: &mut program.references,
+            seen: HashSet::new(),
+        };
+        // (user symbol, module) pairs where the module's whole namespace is used.
+        let mut whole_module_uses: Vec<(SymbolId, SymbolId)> = Vec::new();
+
         // Pass 2: resolve references within each file.
-        for (_path, result) in &parsed {
+        for (path, result) in &parsed {
+            let base = Path::new(path.as_str()).parent().unwrap_or(Path::new(""));
             for r in &result.refs {
-                let to = match &r.target {
-                    parse::RefTarget::Symbol(id) => Some(*id),
-                    parse::RefTarget::Name(name) => global_names.get(name).copied(),
-                };
-                if let Some(to) = to {
-                    program.references.push(Reference {
+                match &r.target {
+                    parse::RefTarget::Symbol(id) => edges.push(Reference {
                         from: r.from,
-                        to,
+                        to: *id,
                         kind: r.kind,
                         environment: r.environment,
-                    });
+                    }),
+                    parse::RefTarget::Name(name) => {
+                        if let Some(&to) = global_names.get(name) {
+                            edges.push(Reference {
+                                from: r.from,
+                                to,
+                                kind: r.kind,
+                                environment: r.environment,
+                            });
+                        }
+                    }
+                    parse::RefTarget::Member(name) => {
+                        for &to in members_by_name.get(name).into_iter().flatten() {
+                            edges.push(Reference {
+                                from: r.from,
+                                to,
+                                kind: r.kind,
+                                environment: r.environment,
+                            });
+                        }
+                    }
+                    parse::RefTarget::Module(spec) | parse::RefTarget::ModuleNamespace(spec) => {
+                        let (source_path, _env) =
+                            resolve_module_path(base, spec, &browser_map, &resolver);
+                        let key = normalize_path(&source_path).to_string_lossy().into_owned();
+                        if let Some(&module) = module_paths.get(&key) {
+                            edges.push(Reference {
+                                from: r.from,
+                                to: module,
+                                kind: r.kind,
+                                environment: r.environment,
+                            });
+                            if matches!(r.target, parse::RefTarget::ModuleNamespace(_)) {
+                                whole_module_uses.push((r.from, module));
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -755,7 +891,7 @@ impl JavaScriptAnalyzer {
                     .iter()
                     .find(|s| s.kind == SymbolKind::Module)
                     .map(|s| s.file.parent().unwrap_or(&s.file))
-                    .map(|p| resolve_module_path(p, &imp.source, &browser_map))
+                    .map(|p| resolve_module_path(p, &imp.source, &browser_map, &resolver))
                     .unwrap_or_else(|| (root.join(&imp.source), Environment::Universal));
                 // An explicit guard (Tier 1) is a stronger signal than the browser-field
                 // remap (which only tells us "this specifier differs in a browser build").
@@ -765,48 +901,60 @@ impl JavaScriptAnalyzer {
                     resolved_env
                 };
 
-                let source_path_str = source_path.to_string_lossy().into_owned();
+                let source_path_str = normalize_path(&source_path).to_string_lossy().into_owned();
 
                 // Find the target module in module_paths
-                if let Some(&target_module_id) = module_paths.get(&source_path_str) {
-                    // Look up the imported name in the target module
-                    if let Some(&def_id) =
-                        name_in_module.get(&(target_module_id, imp.local_name.clone()))
+                let Some(&target_module_id) = module_paths.get(&source_path_str) else {
+                    // Not part of the analyzed tree (third-party package, unresolved path).
+                    continue;
+                };
+
+                // The definition in the *target module* the import names: a default import
+                // binds whatever the module's default export is, which by convention shares
+                // the importing binding's name; a named import looks up the exported name.
+                // (Never a same-named symbol elsewhere in the project -- that is an accident
+                // of naming, not what the import refers to. And a *guessed* default must be
+                // a declaration: the module may import something of the same name itself.)
+                let mut linked = false;
+                if imp.imported_name == "*" {
+                    // Namespace import / `export * from`: every export of the module.
+                    whole_module_uses.push((imp.symbol_id, target_module_id));
+                    linked = true;
+                } else {
+                    let guessed_default = imp.imported_name == "default";
+                    let lookup = if guessed_default {
+                        &imp.local_name
+                    } else {
+                        &imp.imported_name
+                    };
+                    if let Some(&def_id) = name_in_module
+                        .get(&(target_module_id, lookup.clone()))
+                        .filter(|&&id| {
+                            !guessed_default || program.symbols[id].kind != SymbolKind::Import
+                        })
                     {
-                        program.references.push(Reference {
+                        edges.push(Reference {
                             from: imp.symbol_id,
                             to: def_id,
                             kind: RefKind::ReExport,
                             environment: ref_env,
                         });
-                    } else if imp.is_default {
-                        // For CommonJS default imports, fall back to the global def_index
-                        // (handles module.exports = function() {} patterns). Never do this
-                        // for a target resolved into third-party (node_modules) code: the
-                        // specific export name genuinely wasn't found there, and searching
-                        // the whole project for a same-named symbol risks wrongly linking
-                        // an external package's import to an unrelated local definition.
-                        let target_is_external = program
-                            .symbols
-                            .get(target_module_id)
-                            .map(|s| s.is_external)
-                            .unwrap_or(false);
-                        if !target_is_external {
-                            if let Some(&def_id) = def_index.get(&imp.local_name) {
-                                program.references.push(Reference {
-                                    from: imp.symbol_id,
-                                    to: def_id,
-                                    kind: RefKind::ReExport,
-                                    environment: ref_env,
-                                });
-                            }
-                        }
+                        linked = true;
                     }
-                } else {
-                    // For CommonJS modules that might not be in module_paths,
-                    // try to resolve using node_modules or external packages
-                    // For now, just skip external packages
                 }
+                // A default import (or `require`) that names no definition is the whole
+                // module object -- `const agent = require('./agent'); agent.get()`.
+                if !linked && imp.is_default {
+                    whole_module_uses.push((imp.symbol_id, target_module_id));
+                }
+                // Importing a module runs it, so it is reachable whenever the import is
+                // (pushed after the definition edge so that stays the import's first edge).
+                edges.push(Reference {
+                    from: imp.symbol_id,
+                    to: target_module_id,
+                    kind: RefKind::ReExport,
+                    environment: ref_env,
+                });
             }
         }
 
@@ -821,8 +969,9 @@ impl JavaScriptAnalyzer {
         for (path, result) in &parsed {
             let base = Path::new(path.as_str()).parent().unwrap_or(Path::new(""));
             for reg in &result.vue_async_components {
-                let (source_path, _env) = resolve_module_path(base, &reg.source, &browser_map);
-                let source_path_str = source_path.to_string_lossy().into_owned();
+                let (source_path, _env) =
+                    resolve_module_path(base, &reg.source, &browser_map, &resolver);
+                let source_path_str = normalize_path(&source_path).to_string_lossy().into_owned();
                 let Some(&target_module_id) = module_paths.get(&source_path_str) else {
                     continue;
                 };
@@ -842,7 +991,7 @@ impl JavaScriptAnalyzer {
                 else {
                     continue;
                 };
-                program.references.push(Reference {
+                edges.push(Reference {
                     from: local_const_id,
                     to: target_component_id,
                     kind: RefKind::Dynamic,
@@ -850,6 +999,7 @@ impl JavaScriptAnalyzer {
                 });
             }
         }
+        drop(edges);
 
         // Pass 3.7: Vue template usage (component tags, `:is` dynamic
         // bindings) -> reachability edges. A component's rendered template
@@ -899,11 +1049,14 @@ impl JavaScriptAnalyzer {
                     environment: Environment::Universal,
                 });
             }
+
+            // Script bindings (handlers, state, imported components) named in a template.
+            template_bindings::add_template_binding_edges(&mut program, &sites);
         }
 
         // Pass 4: detect and mark entrypoints
-        program.entrypoints = detect_entrypoint_symbols(&program, &file_module, root)
-            .map_err(|e| std::io::Error::other(e.to_string()))?;
+        let detection = detect_entries(&program, root);
+        program.entrypoints = detection.entrypoints;
 
         // A `createApp(...).mount(...)` file is always the app's real
         // entrypoint, whatever its name or `package.json`'s `main` field
@@ -916,6 +1069,20 @@ impl JavaScriptAnalyzer {
             }
         }
 
+        // Pass 5: exported declarations of entry modules (a package's API, a route file, a
+        // config or story read by a tool), and of modules used as a whole (`export *`,
+        // `import * as`, `require`, `import()`), are used from outside.
+        exports::add_export_edges(
+            &mut program,
+            &exported_by_module,
+            &detection.api_roots,
+            &whole_module_uses,
+        );
+
+        // Pass 6: constructors, framework lifecycle methods, overrides of external base
+        // classes, and `React` under the classic JSX transform.
+        implicit::add_implicit_edges(&mut program, &file_sources);
+
         Ok((program, parsed))
     }
 }
@@ -927,5 +1094,12 @@ impl Analyzer for JavaScriptAnalyzer {
 
     fn analyze(&self, root: &Path) -> Result<Program, AnalyzeError> {
         self.analyze_impl(root).map(|(program, _parsed)| program)
+    }
+
+    fn analyze_with_diagnostics(
+        &self,
+        root: &Path,
+    ) -> Result<(Program, Vec<Diagnostic>), AnalyzeError> {
+        self.analyze_full(root, ResolutionMode::Static, None, 0)
     }
 }

@@ -6,6 +6,24 @@ loop that refactors a codebase lean — verified by the project's own smoke test
 
 ---
 
+## 0. Status checklist (roadmap)
+
+- [x] Shared IR, linear reachability, tiered classification, deterministic output
+- [x] `check` CLI: human + versioned JSON, `--fail-on`, `--fail-on-diagnostics`, exit codes 0/1/2
+- [x] Python, JavaScript, TypeScript analyzers (tree-sitter)
+- [x] JS/TS: entrypoint + public-API detection, tsconfig/package.json/workspace resolution
+- [x] JS/TS: React, Angular, Vue support; framework diagnostics surfaced in `check`
+- [x] Accuracy benchmark on real repos (`scripts/bench.py`, `docs/accuracy.md`)
+- [x] CI + release workflows (written; **not yet verified on GitHub / Windows**)
+- [ ] `fix` agent loop, worktree isolation, smoke/CI gate (currently exits 2)
+- [ ] Runtime profiling cost signal (static estimate only today)
+- [ ] AI providers (`BloatAi`), uncertain-reference disambiguation
+- [ ] Incremental SQLite index for large repos; parallel parsing
+- [ ] Flow syntax support (facebook/react-style code is noisy)
+- [ ] Go, Rust, Java, Kotlin, C, C++, Ruby analyzers
+
+---
+
 ## 1. Mission
 
 Identify code that is "clearly taxing the system or app," regardless of whether it happens
@@ -13,11 +31,9 @@ to still work. Bloat is not only *dead code* (unreachable / unused) but any **hi
 low-usage** code: heavy modules pulled in for one cold call, import chains that drag the
 whole app down, orphaned functions, unused imports, pullable dependencies.
 
-The tool operates in two modes:
-
 - **`spectograph check`** — read-only. Builds the cost/usage model and reports bloat.
-- **`spectograph fix`** — mutating. Refactors the whole codebase in an isolated worktree,
-  gated by smoke tests + CI, iterating until lean and fast enough.
+- **`spectograph fix`** — mutating (planned). Refactors in an isolated worktree, gated by
+  smoke tests + CI, iterating until lean.
 
 ---
 
@@ -29,198 +45,113 @@ The tool operates in two modes:
 | Analyzed languages | Python, JS, TS, Go, Rust, Java, Kotlin, C, C++, Ruby (10) |
 | Language depth | Uneven: Python/JS/TS deep first; C/C++ static-only first pass |
 | Bloat definition | **cost / usage** ratio (not just reachability) |
-| Cost signal | **Runtime profiling** (user entry commands + sampling, CPU first); static fallback when no workload |
+| Cost signal | **Runtime profiling** (entry commands + sampling, CPU first); static fallback |
 | Dynamic refs | Static pass first; deterministic refactoring first; AI for ambiguous cases only |
-| AI providers | Anthropic, OpenAI, Gemini, Amazon Bedrock, Google Vertex, Mistral, opencode zen, opencode go — **all treated equally**, none default |
-| Scope | Everything except `.gitignore` (incl. nested/global); **per-language** only, no cross-language reachability |
+| AI providers | Anthropic, OpenAI, Gemini, Bedrock, Vertex, Mistral, opencode zen/go — all equal |
+| Scope | Everything except `.gitignore`; **per-language** only, no cross-language reachability |
 | Output | CLI (human, tiered) + versioned JSON; nonzero exit for CI; `--fail-on <tier>` |
-| `fix` safety | Edits in a **separate git worktree**; asks before merging to main |
-| Correctness gate | smoke tests → full suite → green, within a time budget + bloat score under threshold |
-| Agent loop | cost-effective, with thinking-loop detection + escape hatches |
+| Accuracy | **Precision first**: a 🔴 finding in a healthy project should be true |
+| `fix` safety | Separate git worktree; asks before merging |
+| Correctness gate | smoke tests → full suite → green, within time budget + score threshold |
 | Scale | 10k → 1M LOC: batch for small, incremental index for large |
 
 ---
 
 ## 3. Workspace layout
 
-Implemented so far:
-
 ```
-spectograph/                     (Cargo workspace)
-├── DESIGN.md                    ← this file (single source of truth)
-├── README.md                    ← current implementation status
-├── Cargo.toml
-├── .gitattributes              ← marks fixtures as generated code to exclude from language stats
-├── fixtures/                   ← test fixtures (excluded from language breakdown via .gitattributes)
-│   ├── javascript/             ← JS sample projects for integration tests
-│   └── python/                 ← Python sample projects for integration tests
-├── spectograph-core/           IR, cost model, bloat ranking, reporting
-├── spectograph-cli/            the binary: check / fix subcommands
-├── spectograph-analyzer/       analyzer trait + harness
+spectograph/
+├── DESIGN.md  README.md  CLAUDE.md  CHANGELOG.md
+├── docs/                       json-schema.md, accuracy.md, cookbooks
+├── scripts/bench.py            accuracy benchmark on real repos
+├── .github/workflows/          ci.yml, release.yml
+├── fixtures/                   legacy directory fixtures (js, python)
+├── spectograph-core/           IR, cost model, reachability, reporting, diagnostics
+├── spectograph-cli/            the binary: check / fix(stub)
+├── spectograph-analyzer/       analyzer trait + discovery
 ├── spectograph-py/             Python analyzer
-├── spectograph-js/             JS analyzer; shared React/Vue framework support
-├── spectograph-ts/             TS analyzer; Angular support; reuses JS's React/Vue support
-└── spectograph-tsserver/       shared typescript-language-server LSP client (spectograph-js + spectograph-ts)
+├── spectograph-js/             JS analyzer + shared JS/TS modules (see below)
+├── spectograph-ts/             TS analyzer; Angular; reuses spectograph-js
+└── spectograph-tsserver/       shared typescript-language-server client
 ```
 
-Framework-specific support (React, Angular, Vue) is not a separate crate per framework —
-it's layered additively inside `spectograph-js`/`spectograph-ts` on top of the same
-symbol/reference graph the base analyzer builds, since a component is still an ordinary
-symbol and framework facts (props, template-usage edges) are just extra data collected in
-the same parse pass. See `spectograph-js/src/react.rs`, `spectograph-js/src/vue.rs`, and
-`spectograph-ts/src/angular.rs`.
+Shared JS/TS modules in `spectograph-js`: `aliases` (project resolver), `tsconfig` +
+`jsonc`, `pathutil`, `entrypoints`, `exports`, `implicit`, `template_bindings`,
+`diagnostics`, `react`, `vue`. Framework support is additive on the same parse pass, not a
+crate per framework.
 
-Not yet started — one crate each, following the same `Analyzer` trait as the languages
-above:
-
-```
-├── spectograph-go/             Go analyzer
-├── spectograph-rs/             Rust analyzer
-├── spectograph-java/           Java analyzer
-├── spectograph-kotlin/         Kotlin analyzer
-├── spectograph-c/              C analyzer
-├── spectograph-cpp/            C++ analyzer
-└── spectograph-ruby/           Ruby analyzer
-```
-
-Each language crate parses and resolves references for its language and emits a
-language-agnostic `Program`. All bloat logic lives once in `core`.
+Not yet started: `spectograph-go`, `-rs`, `-java`, `-kotlin`, `-c`, `-cpp`, `-ruby`.
 
 ---
 
-## 4. Shared IR (what every analyzer emits)
+## 4. Shared IR
 
 ```rust
-pub struct Program {
-    pub symbols: Vec<Symbol>,
-    pub references: Vec<Reference>,
-    pub entrypoints: Vec<SymbolId>,
-    pub language: Language,
-    pub root: PathBuf,
-}
-
-pub struct Symbol {
-    pub id: SymbolId,
-    pub name: String,
-    pub kind: SymbolKind,     // Function, Class, Import, Export, Const, Type, Module
-    pub file: PathBuf,
-    pub span: SourceSpan,
-    pub reachable: bool,      // filled by core's reachability walk
-    pub environment: Environment,  // Universal, Node, or Browser
-    pub is_external: bool,    // third-party (e.g. node_modules) code, excluded from findings
-}
-
-pub struct Reference {
-    pub from: SymbolId,
-    pub to: SymbolId,
-    pub kind: RefKind,        // Static, ReExport, Dynamic, Reflection, StringKeyed
-    pub environment: Environment,
-}
+pub struct Program { symbols, references, entrypoints, language, root, reachable }
+pub struct Symbol  { id, name, kind, file, span, reachable, environment, is_external }
+pub struct Reference { from, to, kind: RefKind, environment }
 ```
 
-`core` only ever sees `Program`. Adding a language = one crate producing a `Program`.
+`RefKind`: Static, ReExport, Dynamic, Reflection, StringKeyed (only the first two are
+walked). Parsers emit `RefTarget`s (`Symbol`, `Name`, `Member`, `Module`, `ModuleNamespace`)
+that the analyzer resolves into edges. `core` only ever sees `Program`.
 
 ---
 
 ## 5. Analysis pipeline
 
-```mermaid
-flowchart TD
-    S[Source tree\nrespecting .gitignore] --> P[[spectograph-lang: parse + resolve]]
-    P --> IR[(IR: symbols + refs + uncertainty)]
-    IR --> C[core: cost model + usage intensity]
-    IR --> U[Uncertain refs]
-    U --> AI[[BloatAi provider\nstatic-first, AI for ambiguity]]
-    AI --> C
-    C --> R[Report: CLI / JSON]
-    R --> FX[[spectograph fix]]
-    FX --> AI
-    FX --> P
-    FX -- smoke + CI gate, loop until lean --> R
-```
+parse → resolve in-file refs → resolve imports (+ module edges) → framework passes →
+entrypoint/API-root detection → export edges (API roots, whole-module uses) → implicit
+edges (constructors, lifecycle, external bases) → `core` reachability + cost + tiers →
+report.
 
-### 5.1 Cost model (runtime profiling)
-- User-provided **entry commands** + sampling; attribute measured cost per symbol.
-- **CPU time first**; memory/startup later phases.
-- Static fallback (LOC, import-chain weight, estimated loops) when no workload is given,
-  so the tool never dead-ends on a repo it can't run.
+### 5.1 Cost model
+Static estimate today (LOC, import weight); runtime profiling is planned.
 
-### 5.2 Uncertainty & AI providers
-- Static pass marks uncertain references (`Dynamic`, `Reflection`, `StringKeyed`).
-- `BloatAi` trait normalizes auth, streaming, tool-calling, token accounting across all
-  nine providers. Provider selection is user config; none is privileged.
-- **Deterministic refactoring first; AI only for ambiguous, high-impact cases** — cheaper
-  and less prone to loop.
+### 5.2 Uncertainty & AI providers (planned)
+Uncertain refs are never walked and never prove anything dead. `BloatAi` will normalize
+providers; deterministic refactoring first, AI only for ambiguous high-impact cases.
 
 ### 5.3 Bloat score
-- `bloat = cost / usage`. High cost + low usage = bloat, regardless of reachability.
-- Configurable per-symbol budget + ranking of top-N most expensive symbols.
+`bloat = cost / usage`; tiers: 🔴 guaranteed (zero usage), 🟠 probable (only uncertain
+usage), 🟡 high cost / low usage.
 
 ---
 
-## 6. Agent loop (`spectograph fix`)
+## 6. Agent loop (`spectograph fix`) — planned
 
-Refactors the whole codebase. Structure:
+Targeted context (top-N candidates), tiered models, rerank each iteration, incremental
+re-analysis.
 
-```
-iter 1: score 342, spend $0.03  ── remove 5 dead
-iter 2: score 180, spend $0.02  ── merge 2 dup
-iter 3: score 41,  spend $0.01  ── no improvement → LEAN ✓
-```
-
-- **Targeted context**: feed only top-N candidates ranked by bloat score + local context,
-  never the whole repo.
-- **Tiered models**: cheap/fast for disambiguation + low-risk removal; escalate to a bigger
-  model only for ambiguous, high-impact refactors. Capped token budget per fix and per run.
-- **Rerank each iteration**: recompute scores, re-analyze only affected files (incremental).
-
-### 6.1 Thinking-loop detection (abort, don't spin)
-Stop the loop when any fire:
-
-- **Oscillation**: file state A→B→A→B.
-- **Stall**: score stops improving across 2+ iterations (no monotonic gain).
-- **No-op**: proposed fix produces an empty diff.
-- **Revisit**: same candidate re-suggested after being handled.
-- **Budget**: token budget or `--max-iterations` exhausted.
-
-On abort: keep the best (lowest score) state seen and report *why* it stopped.
+### 6.1 Thinking-loop detection
+Abort on oscillation, stall, no-op diff, revisited candidate, or budget exhaustion; keep the
+best state and report why.
 
 ### 6.2 Safety & worktree isolation
-- Agent edits live in a **separate git worktree**; nothing touches the main tree.
-- **Correctness gate**: run the project's own smoke tests → full suite → green, within a
-  time budget, plus bloat score under the configured threshold.
-- Only after the gate passes does the tool **ask** before merging/opening a PR to the main
-  worktree.
-- Monotonic guard: reject any fix that increases total bloat score.
-- Audit trail: per-iteration diff + score delta.
+Edits in a separate worktree; correctness gate (smoke → full suite); ask before merging;
+monotonic guard; per-iteration audit trail.
 
 ---
 
 ## 7. Output & CI
 
-- `--format human` (default): tiered spectrograph-style table.
-- `--format json`: versioned, machine-stable schema; consumed by CI and `fix`.
-- Nonzero exit when bloat found; `--fail-on <tier>` for softer gates (e.g. fail only on 🔴).
-- Tiers:
-  - 🔴 guaranteed bloat (zero usage, all static)
-  - 🟠 probably bloat (only dynamic/uncertain usage)
-  - 🟡 high cost / low usage (used but taxing)
+- `--format human` (default) and `--format json` (`schema_version` 1, see
+  `docs/json-schema.md`; additive changes don't bump it).
+- Exit codes: 0 clean, 1 findings at/above `--fail-on` (or diagnostics with
+  `--fail-on-diagnostics`), 2 error.
+- Report paths are root-relative, `/`-separated; output is deterministic.
 
 ---
 
 ## 8. Scale
 
-- **Small** (`< ~50k LOC`): one-shot batch, parse everything in memory.
-- **Large** (`> ~50k LOC`): incremental index backed by a graph store (SQLite). Parse only
-  dirty files, build the reference graph incrementally, chunk analysis so the AI provider
-  never sees the whole repo at once. The IR is identical; only plumbing changes.
+Reachability is linear (200k-symbol test in CI). Parsing is single-threaded; large repos
+(facebook/react, ~32k symbols) take ~30s, dominated by tree-sitter error recovery on Flow
+syntax. Planned: parallel parsing, incremental SQLite index above ~50k LOC.
 
 ---
 
 ## 9. Config surface (initial)
 
-- `.gitignore` honored by default; explicit include-overrides allowed.
-- Entry/test/CI commands per repo and per language.
-- Bloat budget + `--fail-on` tier.
-- Provider selection + credentials (config file + env vars, OS keychain for secrets).
-- Scale thresholds, time budgets, `--max-iterations`.
+`.gitignore` honored; entry/test/CI commands per repo; bloat budget + `--fail-on`; provider
+selection and credentials; scale thresholds, time budgets, `--max-iterations`.

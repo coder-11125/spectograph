@@ -28,6 +28,26 @@ fn class_id(program: &Program, name: &str) -> spectograph_core::ir::SymbolId {
         .id
 }
 
+/// References from `class` to anything that is not one of its own members. A class always
+/// uses its own constructor (it runs on `new`), so `Widget -> Widget.constructor` is not a
+/// dependency on anything else.
+fn external_edges_from(program: &Program, class: &str) -> Vec<(usize, usize)> {
+    let id = class_id(program, class);
+    let prefix = format!("{class}.");
+    let own: Vec<usize> = program
+        .symbols
+        .iter()
+        .filter(|s| s.name.starts_with(&prefix))
+        .map(|s| s.id)
+        .collect();
+    program
+        .references
+        .iter()
+        .filter(|r| r.from == id && !own.contains(&r.to))
+        .map(|r| (r.from, r.to))
+        .collect()
+}
+
 #[test]
 fn undecorated_typed_constructor_param_creates_di_edge() {
     // The idiomatic Angular case: no @Inject() at all, just a typed parameter.
@@ -189,11 +209,11 @@ fn primitive_typed_params_create_no_di_edge() {
         "app.ts",
         "class Widget {\n    constructor(private name: string, private count: number) {}\n}",
     )]);
-    let widget = class_id(&program, "Widget");
-    // Only an edge from Widget itself would indicate a (bogus) DI resolution
-    // attempt on a primitive type; there should be none at all here.
-    assert!(
-        !program.references.iter().any(|r| r.from == widget),
+    // Only an edge from Widget to something else would indicate a (bogus) DI
+    // resolution attempt on a primitive type; there should be none at all here.
+    assert_eq!(
+        external_edges_from(&program, "Widget"),
+        Vec::new(),
         "primitive-typed constructor params must not produce DI edges"
     );
 }
@@ -224,6 +244,5 @@ fn untyped_constructor_param_creates_no_di_edge() {
         "app.ts",
         "class Widget {\n    constructor(private options) {}\n}",
     )]);
-    let widget = class_id(&program, "Widget");
-    assert!(!program.references.iter().any(|r| r.from == widget));
+    assert_eq!(external_edges_from(&program, "Widget"), Vec::new());
 }

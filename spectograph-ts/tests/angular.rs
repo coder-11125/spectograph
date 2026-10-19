@@ -220,10 +220,11 @@ fn plain_component_decorator_without_reference_arrays_creates_no_extra_edges() {
 }
 
 #[test]
-fn unrelated_decorator_does_not_create_reference_array_edges() {
-    // @Injectable/@Directive/@Pipe aren't NgModule/Component, so even if one
-    // somehow had an array-shaped argument, it must not be interpreted this
-    // way.
+fn unrelated_decorator_arguments_are_plain_references_not_ngmodule_arrays() {
+    // @Injectable/@Directive/@Pipe aren't NgModule/Component, so an array-shaped
+    // argument must not be interpreted as NgModule-style wiring. `Dep` is still
+    // genuinely named in the decorator, so the class depends on it the way it depends on
+    // any identifier it mentions: one ordinary static reference, nothing more.
     let program = analyze_ts(&[(
         "foo.service.ts",
         r#"class Dep {}
@@ -233,7 +234,19 @@ class FooService {}
 "#,
     )]);
     let service = class_id(&program, "FooService");
-    assert!(!program.references.iter().any(|r| r.from == service));
+    let dep = class_id(&program, "Dep");
+    let from_service: Vec<_> = program
+        .references
+        .iter()
+        .filter(|r| r.from == service)
+        .collect();
+    assert!(
+        from_service
+            .iter()
+            .all(|r| r.to == dep && r.kind == RefKind::Static),
+        "only the plain reference to Dep is expected: {from_service:?}"
+    );
+    assert_eq!(from_service.len(), 1, "{from_service:?}");
 }
 
 #[test]

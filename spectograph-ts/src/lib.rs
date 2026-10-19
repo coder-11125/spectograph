@@ -3,6 +3,7 @@
 //! Parses TypeScript source with tree-sitter into the shared [`Program`] IR.
 
 pub mod angular;
+pub mod diagnostics;
 pub mod entrypoints;
 pub mod parse;
 
@@ -29,9 +30,16 @@ use std::path::{Path, PathBuf};
 use parse::parse_file;
 use serde_json::Value;
 use spectograph_analyzer::{discover, AnalyzeError, Analyzer};
+use spectograph_core::diagnostic::Diagnostic;
 use spectograph_core::ir::{
     Environment, Language, Program, RefKind, Reference, SymbolId, SymbolKind,
 };
+use spectograph_js::aliases::ProjectResolver;
+use spectograph_js::entrypoints::detect_entries;
+use spectograph_js::exports::{self, ExportedByModule};
+use spectograph_js::pathutil::normalize_path;
+use spectograph_js::tsconfig::TsConfig;
+use spectograph_js::{implicit, template_bindings};
 
 /// Analyzer for the TypeScript language (`.ts`/`.tsx`/`.mts`/`.cts`).
 pub struct TypeScriptAnalyzer;
@@ -45,83 +53,45 @@ pub enum ResolutionMode {
     Tsserver,
 }
 
-/// `compilerOptions.baseUrl`/`paths` read from the project's `tsconfig.json`.
-/// Missing or unparsable `tsconfig.json` (including the common case of it
-/// containing JSONC comments, which `serde_json` can't parse) just yields an
-/// empty config -- resolution falls back to relative/node_modules lookup only.
-#[derive(Default)]
-struct TsConfig {
-    /// Resolved to an absolute path already (root joined with the raw `baseUrl`).
-    base_url: Option<PathBuf>,
-    paths: HashMap<String, Vec<String>>,
-    /// Top-level `include`/`exclude` glob patterns, kept as `None` when the key
-    /// is absent from `tsconfig.json` (as opposed to present-but-empty) so file
-    /// filtering can tell "no tsconfig opinion here" from "matches nothing" --
-    /// see [`filter_by_tsconfig`].
-    include: Option<Vec<String>>,
-    exclude: Option<Vec<String>>,
+/// Read a source file as text, replacing invalid UTF-8 rather than failing: a single
+/// latin-1 or binary-ish file in a repo must not abort the analysis of everything else.
+fn read_source(path: &Path) -> std::io::Result<String> {
+    std::fs::read(path).map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
 }
 
-fn read_tsconfig(root: &Path) -> TsConfig {
-    let Some(json) = std::fs::read_to_string(root.join("tsconfig.json"))
+/// Compile one `tsconfig.json` glob. As in `tsc`, `*` and `?` stay within a single path
+/// segment (`scripts/*` is the files directly in `scripts/`, not its subdirectories); only
+/// `**` crosses directories.
+fn tsconfig_glob(pattern: &str) -> Option<globset::Glob> {
+    globset::GlobBuilder::new(pattern)
+        .literal_separator(true)
+        .build()
         .ok()
-        .and_then(|s| serde_json::from_str::<Value>(&s).ok())
-    else {
-        return TsConfig::default();
-    };
-    let compiler_options = json.get("compilerOptions");
-    let base_url = compiler_options
-        .and_then(|c| c.get("baseUrl"))
-        .and_then(|v| v.as_str())
-        .map(|b| normalize_path(&root.join(b)));
-    let paths = compiler_options
-        .and_then(|c| c.get("paths"))
-        .and_then(|v| v.as_object())
-        .map(|obj| {
-            obj.iter()
-                .filter_map(|(k, v)| {
-                    let targets: Vec<String> = v
-                        .as_array()?
-                        .iter()
-                        .filter_map(|x| x.as_str().map(String::from))
-                        .collect();
-                    Some((k.clone(), targets))
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-    let string_array = |key: &str| {
-        json.get(key).and_then(|v| v.as_array()).map(|arr| {
-            arr.iter()
-                .filter_map(|x| x.as_str().map(String::from))
-                .collect()
-        })
-    };
-    let include = string_array("include");
-    let exclude = string_array("exclude");
-    TsConfig {
-        base_url,
-        paths,
-        include,
-        exclude,
-    }
 }
 
-/// Build a matcher for a list of `tsconfig.json` `include`/`exclude` glob
-/// patterns. A bare name with no glob metacharacters that names an existing
-/// directory under `root` (e.g. `"node_modules"`) is expanded to match
-/// everything under it too, the same way `tsc` treats such entries.
+/// Build a matcher for a list of `tsconfig.json` `include`/`exclude` glob patterns.
+///
+/// `tsc` treats a pattern whose last path segment has no extension and no wildcard
+/// (`"src"`, `"packages/*/src"`, `"node_modules"`) as a *directory* and includes everything
+/// beneath it, so those get a `/**` companion. (A literal existing directory with a dot in
+/// its name is covered too.) Without this, `"packages/*/src"` -- the standard monorepo
+/// include -- would match only the directories themselves and silently drop every file.
 fn build_globset(patterns: &[String], root: &Path) -> Option<globset::GlobSet> {
     if patterns.is_empty() {
         return None;
     }
     let mut builder = globset::GlobSetBuilder::new();
     for pattern in patterns {
-        if let Ok(glob) = globset::Glob::new(pattern) {
+        if let Some(glob) = tsconfig_glob(pattern) {
             builder.add(glob);
         }
-        if !pattern.contains(['*', '?', '[']) && root.join(pattern).is_dir() {
-            if let Ok(glob) = globset::Glob::new(&format!("{pattern}/**")) {
+        let trimmed = pattern.trim_end_matches('/');
+        let last_segment = trimmed.rsplit('/').next().unwrap_or(trimmed);
+        let is_directory_pattern = !last_segment.contains(['.', '*', '?', '[']);
+        let is_existing_directory =
+            !trimmed.contains(['*', '?', '[']) && root.join(trimmed).is_dir();
+        if is_directory_pattern || is_existing_directory {
+            if let Some(glob) = tsconfig_glob(&format!("{trimmed}/**")) {
                 builder.add(glob);
             }
         }
@@ -161,63 +131,33 @@ fn filter_by_tsconfig(files: Vec<PathBuf>, root: &Path, tsconfig: &TsConfig) -> 
         .collect()
 }
 
-/// Match `specifier` against `paths` patterns (each may contain one `*`
-/// wildcard), returning the substituted candidate target paths in the same
-/// (unresolved-to-baseUrl) form they appear in `tsconfig.json`. An exact,
-/// non-wildcard pattern always wins; among wildcard matches, the longest
-/// literal prefix wins (TS's own tie-breaking rule).
-fn resolve_paths_alias(
-    specifier: &str,
-    paths: &HashMap<String, Vec<String>>,
-) -> Option<Vec<String>> {
-    if let Some(targets) = paths.get(specifier) {
-        return Some(targets.clone());
-    }
-    let mut best: Option<(usize, &str, &Vec<String>)> = None; // (prefix_len, middle, targets)
-    for (pattern, targets) in paths {
-        let Some(star) = pattern.find('*') else {
-            continue;
-        };
-        let prefix = &pattern[..star];
-        let suffix = &pattern[star + 1..];
-        if specifier.len() < prefix.len() + suffix.len()
-            || !specifier.starts_with(prefix)
-            || !specifier.ends_with(suffix)
-        {
-            continue;
-        }
-        let middle = &specifier[prefix.len()..specifier.len() - suffix.len()];
-        if best.map(|(len, _, _)| prefix.len() > len).unwrap_or(true) {
-            best = Some((prefix.len(), middle, targets));
-        }
-    }
-    let (_, middle, targets) = best?;
-    Some(targets.iter().map(|t| t.replacen('*', middle, 1)).collect())
-}
+/// TypeScript's ESM convention: an import written `./foo.js` names the source file
+/// `./foo.ts` (the specifier is what the *compiled* output will be called).
+const JS_TO_TS_EXTENSIONS: &[(&str, &[&str])] = &[
+    (".js", &[".ts", ".tsx", ".d.ts"]),
+    (".jsx", &[".tsx"]),
+    (".mjs", &[".mts", ".d.mts"]),
+    (".cjs", &[".cts", ".d.cts"]),
+];
 
-/// Collapse `.`/`..` components so a joined path's string form matches the plain
-/// paths [`spectograph_analyzer::discover::discover_files`] produces.
-pub(crate) fn normalize_path(path: &Path) -> PathBuf {
-    let mut result = PathBuf::new();
-    for component in path.components() {
-        match component {
-            std::path::Component::CurDir => {}
-            std::path::Component::ParentDir if result.file_name().is_some() => {
-                result.pop();
-            }
-            other => result.push(other),
-        }
-    }
-    result
-}
-
-/// Try `path` as-is, then with a TypeScript source extension, then as a
-/// directory's index file. `.d.ts` is tried last since it's a type-only
-/// declaration file -- a real `.ts`/`.tsx` implementation is preferred when
-/// both exist.
-pub(crate) fn resolve_file_candidate(path: &Path) -> Option<PathBuf> {
+/// Try `path` as-is, then as the TS source behind a `.js`-style specifier, then with a
+/// TypeScript source extension, then as a directory's index file. `.d.ts` is tried last
+/// since it's a type-only declaration file -- a real `.ts`/`.tsx` implementation is
+/// preferred when both exist.
+fn resolve_file_candidate(path: &Path) -> Option<PathBuf> {
     if path.is_file() {
         return Some(path.to_path_buf());
+    }
+    let text = path.to_string_lossy();
+    for (js_ext, ts_exts) in JS_TO_TS_EXTENSIONS {
+        if let Some(stem) = text.strip_suffix(js_ext) {
+            for ts_ext in *ts_exts {
+                let candidate = PathBuf::from(format!("{stem}{ts_ext}"));
+                if candidate.is_file() {
+                    return Some(candidate);
+                }
+            }
+        }
     }
     // Append, don't replace: `Path::with_extension` treats the text after the
     // *last* dot in the file name as "the extension" and replaces it, which
@@ -227,14 +167,21 @@ pub(crate) fn resolve_file_candidate(path: &Path) -> Option<PathBuf> {
     // convention for every file). `with_extension("ts")` on `app.module`
     // produces `app.ts`, not `app.module.ts`, so the guessed candidate never
     // exists and resolution fails outright.
-    for ext in ["ts", "tsx", "vue", "d.ts"] {
-        let candidate = PathBuf::from(format!("{}.{ext}", path.to_string_lossy()));
+    for ext in ["ts", "tsx", "mts", "cts", "vue", "d.ts"] {
+        let candidate = PathBuf::from(format!("{text}.{ext}"));
         if candidate.is_file() {
             return Some(candidate);
         }
     }
     if path.is_dir() {
-        for name in ["index.ts", "index.tsx", "index.vue", "index.d.ts"] {
+        for name in [
+            "index.ts",
+            "index.tsx",
+            "index.mts",
+            "index.cts",
+            "index.vue",
+            "index.d.ts",
+        ] {
             let candidate = path.join(name);
             if candidate.is_file() {
                 return Some(candidate);
@@ -268,13 +215,14 @@ fn resolve_package_entry(pkg_dir: &Path) -> Option<PathBuf> {
 }
 
 /// Node.js/TypeScript-style module resolution: relative paths (with `.ts`/`.tsx`/
-/// `.d.ts` extension guessing), `tsconfig.json` `paths`/`baseUrl` aliases (bare
-/// specifiers only -- TS never remaps relative ones), then `node_modules`.
+/// `.d.ts` extension guessing and `./x.js` -> `x.ts` mapping), then project aliases
+/// (`tsconfig` `paths`/`baseUrl`, `package.json` `imports`, monorepo workspace packages,
+/// `@/`-style conventions -- bare specifiers only, TS never remaps relative ones), then
+/// `node_modules`.
 fn resolve_module_path(
     base: &Path,
     specifier: &str,
-    root: &Path,
-    tsconfig: &TsConfig,
+    resolver: &ProjectResolver,
 ) -> Option<PathBuf> {
     if specifier.starts_with('/') {
         return resolve_file_candidate(&PathBuf::from(specifier));
@@ -283,19 +231,8 @@ fn resolve_module_path(
         return resolve_file_candidate(&normalize_path(&base.join(specifier)));
     }
 
-    if let Some(candidates) = resolve_paths_alias(specifier, &tsconfig.paths) {
-        let paths_base = tsconfig.base_url.as_deref().unwrap_or(root);
-        for candidate in &candidates {
-            if let Some(resolved) =
-                resolve_file_candidate(&normalize_path(&paths_base.join(candidate)))
-            {
-                return Some(resolved);
-            }
-        }
-    }
-
-    if let Some(base_url) = &tsconfig.base_url {
-        if let Some(resolved) = resolve_file_candidate(&normalize_path(&base_url.join(specifier))) {
+    for candidate in resolver.candidates(specifier) {
+        if let Some(resolved) = resolve_file_candidate(&candidate) {
             return Some(resolved);
         }
     }
@@ -399,15 +336,32 @@ fn build_vue_scope_maps(
         .filter_map(|(_p, r)| r.vue_component.as_ref().map(|c| c.symbol_id))
         .collect();
 
+    // Nothing to match against: every map below would come out empty, and skipping the
+    // edge indexing keeps non-Vue projects from paying for it.
+    if vue_component_ids.is_empty() {
+        return (HashMap::new(), HashMap::new(), HashMap::new());
+    }
+
+    // First edge of each kind per source symbol, indexed once instead of rescanning every
+    // reference for every import.
+    let mut first_reexport: HashMap<SymbolId, SymbolId> = HashMap::new();
+    let mut first_dynamic: HashMap<SymbolId, SymbolId> = HashMap::new();
+    for r in &program.references {
+        match r.kind {
+            RefKind::ReExport => {
+                first_reexport.entry(r.from).or_insert(r.to);
+            }
+            RefKind::Dynamic => {
+                first_dynamic.entry(r.from).or_insert(r.to);
+            }
+            _ => {}
+        }
+    }
+
     let mut local_scope: HashMap<(PathBuf, String), SymbolId> = HashMap::new();
     for (path, result) in parsed {
         for imp in &result.imports {
-            let target = program
-                .references
-                .iter()
-                .find(|r| r.from == imp.symbol_id && r.kind == RefKind::ReExport)
-                .map(|r| r.to);
-            if let Some(target) = target {
+            if let Some(&target) = first_reexport.get(&imp.symbol_id) {
                 if vue_component_ids.contains(&target) {
                     local_scope.insert((path.clone(), imp.local_name.clone()), target);
                 }
@@ -422,12 +376,7 @@ fn build_vue_scope_maps(
             else {
                 continue;
             };
-            let target = program
-                .references
-                .iter()
-                .find(|r| r.from == const_id && r.kind == RefKind::Dynamic)
-                .map(|r| r.to);
-            if let Some(target) = target {
+            if let Some(&target) = first_dynamic.get(&const_id) {
                 if vue_component_ids.contains(&target) {
                     local_scope.insert((path.clone(), reg.local_name.clone()), target);
                 }
@@ -456,26 +405,98 @@ fn build_vue_scope_maps(
     (local_scope, global_components, canonical_names)
 }
 
+/// Every Vue template prop/emit mismatch in an already-analyzed project. See
+/// `spectograph_js`'s copy of this function.
+pub(crate) fn vue_mismatches(
+    program: &Program,
+    parsed: &[(PathBuf, parse::FileResult)],
+    root: &Path,
+) -> Result<Vec<vue::VueBindingMismatch>, AnalyzeError> {
+    if parsed.iter().all(|(_p, r)| r.vue_component.is_none()) {
+        return Ok(Vec::new());
+    }
+    let (local_scope, global_components, canonical_names) = build_vue_scope_maps(program, parsed);
+
+    let using_symbol_by_path: HashMap<PathBuf, SymbolId> = parsed
+        .iter()
+        .map(|(path, result)| {
+            let using = result
+                .vue_component
+                .as_ref()
+                .map(|c| c.symbol_id)
+                .unwrap_or(result.module_id);
+            (path.clone(), using)
+        })
+        .collect();
+
+    let mut sites: Vec<vue::TemplateUsageSite> = Vec::new();
+    for path in vue::discover_vue_files(root)? {
+        let src = read_source(&path)?;
+        let sfc = vue::parse_sfc(&src);
+        let (Some(template), Some(&using_symbol)) = (sfc.template, using_symbol_by_path.get(&path))
+        else {
+            continue;
+        };
+        sites.push(vue::TemplateUsageSite {
+            file: path,
+            template: template.content,
+            using_symbol,
+        });
+    }
+
+    let components: Vec<vue::VueComponent> = parsed
+        .iter()
+        .filter_map(|(_p, r)| r.vue_component.clone())
+        .collect();
+
+    Ok(vue::find_binding_mismatches(
+        &components,
+        &sites,
+        &local_scope,
+        &global_components,
+        &canonical_names,
+    ))
+}
+
+/// Collects references while dropping exact duplicates (the same member accessed a hundred
+/// times in one function is one edge).
+struct EdgeSink<'a> {
+    references: &'a mut Vec<Reference>,
+    seen: HashSet<(SymbolId, SymbolId, RefKind)>,
+}
+
+impl EdgeSink<'_> {
+    fn push(&mut self, from: SymbolId, to: SymbolId, kind: RefKind) {
+        if self.seen.insert((from, to, kind)) {
+            self.references.push(Reference {
+                from,
+                to,
+                kind,
+                environment: Environment::Universal,
+            });
+        }
+    }
+}
+
 impl TypeScriptAnalyzer {
-    /// Analyze with a resolution backend. `Static` is equivalent to
-    /// [`Analyzer::analyze`].
-    pub fn analyze_with_resolution(
+    /// Swap the static call-graph edges for type-aware `typescript-language-server` ones.
+    fn apply_resolution(
         &self,
         root: &Path,
+        program: &mut Program,
         resolution: ResolutionMode,
         tsserver_executable: Option<&str>,
         timeout_ms: u64,
-    ) -> Result<Program, AnalyzeError> {
-        let mut program = Analyzer::analyze(self, root)?;
+    ) -> Result<(), AnalyzeError> {
         if resolution == ResolutionMode::Static {
-            return Ok(program);
+            return Ok(());
         }
         let executable = tsserver_executable
             .map(str::to_string)
             .unwrap_or_else(|| "typescript-language-server".to_string());
         let edges = tsserver::resolve_program_edges(
             root,
-            &program,
+            program,
             Language::TypeScript,
             &executable,
             timeout_ms,
@@ -483,7 +504,7 @@ impl TypeScriptAnalyzer {
         .map_err(|e| AnalyzeError::Io(std::io::Error::other(e.to_string())))?;
         // Replace the static call-graph edges between queryable symbols with
         // the type-aware ones (same swap as spectograph-py's pyright backend).
-        let queryable: std::collections::HashSet<SymbolId> = program
+        let queryable: HashSet<SymbolId> = program
             .symbols
             .iter()
             .filter(|s| {
@@ -505,7 +526,49 @@ impl TypeScriptAnalyzer {
                 environment: Environment::Universal,
             });
         }
+        Ok(())
+    }
+
+    /// Analyze with a resolution backend. `Static` is equivalent to
+    /// [`Analyzer::analyze`].
+    pub fn analyze_with_resolution(
+        &self,
+        root: &Path,
+        resolution: ResolutionMode,
+        tsserver_executable: Option<&str>,
+        timeout_ms: u64,
+    ) -> Result<Program, AnalyzeError> {
+        let mut program = Analyzer::analyze(self, root)?;
+        self.apply_resolution(
+            root,
+            &mut program,
+            resolution,
+            tsserver_executable,
+            timeout_ms,
+        )?;
         Ok(program)
+    }
+
+    /// The full `check` pipeline for TypeScript: the [`Program`], framework diagnostics
+    /// (React prop, Angular binding, and Vue prop/emit mismatches) from the same parse pass,
+    /// and the optional type-aware resolution swap.
+    pub fn analyze_full(
+        &self,
+        root: &Path,
+        resolution: ResolutionMode,
+        tsserver_executable: Option<&str>,
+        timeout_ms: u64,
+    ) -> Result<(Program, Vec<Diagnostic>), AnalyzeError> {
+        let (mut program, parsed) = self.analyze_impl(root)?;
+        let diagnostics = diagnostics::collect(&program, &parsed, root)?;
+        self.apply_resolution(
+            root,
+            &mut program,
+            resolution,
+            tsserver_executable,
+            timeout_ms,
+        )?;
+        Ok((program, diagnostics))
     }
 
     /// Like [`Analyzer::analyze`], but also returns every decorator found while
@@ -594,49 +657,7 @@ impl TypeScriptAnalyzer {
         root: &Path,
     ) -> Result<(Program, Vec<vue::VueBindingMismatch>), AnalyzeError> {
         let (program, parsed) = self.analyze_impl(root)?;
-        let (local_scope, global_components, canonical_names) =
-            build_vue_scope_maps(&program, &parsed);
-
-        let using_symbol_by_path: HashMap<PathBuf, SymbolId> = parsed
-            .iter()
-            .map(|(path, result)| {
-                let using = result
-                    .vue_component
-                    .as_ref()
-                    .map(|c| c.symbol_id)
-                    .unwrap_or(result.module_id);
-                (path.clone(), using)
-            })
-            .collect();
-
-        let mut sites: Vec<vue::TemplateUsageSite> = Vec::new();
-        for path in vue::discover_vue_files(root)? {
-            let src = std::fs::read_to_string(&path)?;
-            let sfc = vue::parse_sfc(&src);
-            let (Some(template), Some(&using_symbol)) =
-                (sfc.template, using_symbol_by_path.get(&path))
-            else {
-                continue;
-            };
-            sites.push(vue::TemplateUsageSite {
-                file: path,
-                template: template.content,
-                using_symbol,
-            });
-        }
-
-        let components: Vec<vue::VueComponent> = parsed
-            .iter()
-            .filter_map(|(_p, r)| r.vue_component.clone())
-            .collect();
-
-        let mismatches = vue::find_binding_mismatches(
-            &components,
-            &sites,
-            &local_scope,
-            &global_components,
-            &canonical_names,
-        );
+        let mismatches = vue_mismatches(&program, &parsed, root)?;
         Ok((program, mismatches))
     }
 
@@ -644,11 +665,11 @@ impl TypeScriptAnalyzer {
         &self,
         root: &Path,
     ) -> Result<(Program, Vec<(PathBuf, parse::FileResult)>), AnalyzeError> {
-        let tsconfig = read_tsconfig(root);
+        let resolver = ProjectResolver::load(root);
         let files = filter_by_tsconfig(
             discover::discover_files(root, Language::TypeScript)?,
             root,
-            &tsconfig,
+            resolver.tsconfig(),
         );
 
         // `.vue` Single-File Components aren't owned by `Language::TypeScript`'s
@@ -663,7 +684,7 @@ impl TypeScriptAnalyzer {
         // parseable exactly like a regular file below.
         let mut file_sources: Vec<(PathBuf, String)> = Vec::new();
         for path in &files {
-            let src = std::fs::read_to_string(path)?;
+            let src = read_source(path)?;
             file_sources.push((path.clone(), src));
         }
         // Captured alongside `file_sources` for the Vue template-usage
@@ -677,7 +698,7 @@ impl TypeScriptAnalyzer {
         // indistinguishable from a plain non-Vue file once materialized.
         let mut vue_script_setup_files: HashSet<PathBuf> = HashSet::new();
         for path in vue::discover_vue_files(root)? {
-            let src = std::fs::read_to_string(&path)?;
+            let src = read_source(&path)?;
             let sfc = vue::parse_sfc(&src);
             if let Some((materialized, vue::ScriptLang::TypeScript)) = vue::materialize_script(&sfc)
             {
@@ -704,10 +725,9 @@ impl TypeScriptAnalyzer {
         };
 
         let mut next_id: usize = 0;
-        // Global name -> symbol id (first definition wins, matching the JS/Python
-        // analyzers' "vertical slice" resolution convention).
+        // Global name -> symbol id (first definition wins), used to resolve names no scope
+        // knows (the uncertain, by-name fallback).
         let mut global_names: HashMap<String, SymbolId> = HashMap::new();
-        let mut def_index: HashMap<String, SymbolId> = HashMap::new();
 
         let mut parsed: Vec<(PathBuf, parse::FileResult)> = Vec::new();
         for (path, src) in &file_sources {
@@ -725,23 +745,19 @@ impl TypeScriptAnalyzer {
             for sym in &result.symbols {
                 if sym.kind != SymbolKind::Module {
                     global_names.entry(sym.name.clone()).or_insert(sym.id);
-                    if matches!(
-                        sym.kind,
-                        SymbolKind::Function | SymbolKind::Class | SymbolKind::Const
-                    ) {
-                        def_index.entry(sym.name.clone()).or_insert(sym.id);
-                    }
                 }
             }
             program.symbols.extend(result.symbols.clone());
             parsed.push((path.clone(), result));
         }
 
+        // Normalized so `./src/a.ts` (what a walk of `.` yields) and `src/a.ts` (what
+        // resolution produces) are the same key.
         let module_paths: HashMap<String, SymbolId> = program
             .symbols
             .iter()
             .filter(|s| s.kind == SymbolKind::Module)
-            .map(|s| (s.file.to_string_lossy().into_owned(), s.id))
+            .map(|s| (normalize_path(&s.file).to_string_lossy().into_owned(), s.id))
             .collect();
 
         let mut name_in_module: HashMap<(SymbolId, String), SymbolId> = HashMap::new();
@@ -755,20 +771,50 @@ impl TypeScriptAnalyzer {
             }
         }
 
-        // Pass: resolve in-file references (calls, plain identifiers).
-        for (_path, result) in &parsed {
+        // What each module exposes, and which symbols a property access like `.run` can name.
+        let exported_by_module: ExportedByModule = parsed
+            .iter()
+            .filter(|(_, r)| !r.exported.is_empty())
+            .map(|(_, r)| (r.module_id, r.exported.clone()))
+            .collect();
+        let members_by_name = exports::member_index(&program, &exported_by_module);
+
+        let mut edges = EdgeSink {
+            references: &mut program.references,
+            seen: HashSet::new(),
+        };
+        // (user symbol, module) pairs where the module's whole namespace is used.
+        let mut whole_module_uses: Vec<(SymbolId, SymbolId)> = Vec::new();
+
+        // Pass: resolve in-file references (calls, plain identifiers, member accesses,
+        // module loads).
+        for (path, result) in &parsed {
+            let base = path.parent().unwrap_or(path);
             for r in &result.refs {
-                let to = match &r.target {
-                    parse::RefTarget::Symbol(id) => Some(*id),
-                    parse::RefTarget::Name(name) => global_names.get(name).copied(),
-                };
-                if let Some(to) = to {
-                    program.references.push(Reference {
-                        from: r.from,
-                        to,
-                        kind: r.kind,
-                        environment: Environment::Universal,
-                    });
+                match &r.target {
+                    parse::RefTarget::Symbol(id) => edges.push(r.from, *id, r.kind),
+                    parse::RefTarget::Name(name) => {
+                        if let Some(&to) = global_names.get(name) {
+                            edges.push(r.from, to, r.kind);
+                        }
+                    }
+                    parse::RefTarget::Member(name) => {
+                        for &to in members_by_name.get(name).into_iter().flatten() {
+                            edges.push(r.from, to, r.kind);
+                        }
+                    }
+                    parse::RefTarget::Module(spec) | parse::RefTarget::ModuleNamespace(spec) => {
+                        let Some(source_path) = resolve_module_path(base, spec, &resolver) else {
+                            continue;
+                        };
+                        let key = normalize_path(&source_path).to_string_lossy().into_owned();
+                        if let Some(&module) = module_paths.get(&key) {
+                            edges.push(r.from, module, r.kind);
+                            if matches!(r.target, parse::RefTarget::ModuleNamespace(_)) {
+                                whole_module_uses.push((r.from, module));
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -778,48 +824,91 @@ impl TypeScriptAnalyzer {
         for (path, result) in &parsed {
             let base = path.parent().unwrap_or(path);
             for imp in &result.imports {
-                let Some(source_path) = resolve_module_path(base, &imp.source, root, &tsconfig)
-                else {
+                let Some(source_path) = resolve_module_path(base, &imp.source, &resolver) else {
                     continue;
                 };
-                let source_path_str = source_path.to_string_lossy().into_owned();
+                let source_path_str = normalize_path(&source_path).to_string_lossy().into_owned();
                 let Some(&target_module_id) = module_paths.get(&source_path_str) else {
                     continue;
                 };
 
+                // The definition in the *target module* the import names (never a
+                // same-named symbol elsewhere in the project -- that is an accident of
+                // naming, not what the import refers to). A default import's definition
+                // is a `default` export, or a declaration sharing the binding's name
+                // (`export default class Greeter {}` imported as `Greeter`) -- a
+                // *declaration*, never an import binding of the target module that merely
+                // happens to share the name.
+                let mut linked = false;
                 if imp.imported_name == "*" {
-                    // Namespace import / `export * from` / `export * as ns from`:
-                    // link straight to the target module itself.
-                    program.references.push(Reference {
-                        from: imp.symbol_id,
-                        to: target_module_id,
-                        kind: RefKind::ReExport,
-                        environment: Environment::Universal,
-                    });
-                    continue;
-                }
-
-                if let Some(&def_id) =
+                    // Namespace import / `export * from` / `export * as ns from`: every
+                    // export of the module is in play.
+                    whole_module_uses.push((imp.symbol_id, target_module_id));
+                    linked = true;
+                } else if let Some(&def_id) =
                     name_in_module.get(&(target_module_id, imp.imported_name.clone()))
                 {
-                    program.references.push(Reference {
-                        from: imp.symbol_id,
-                        to: def_id,
-                        kind: RefKind::ReExport,
-                        environment: Environment::Universal,
-                    });
+                    edges.push(imp.symbol_id, def_id, RefKind::ReExport);
+                    linked = true;
                 } else if imp.is_default {
-                    if let Some(&def_id) = def_index.get(&imp.local_name) {
-                        program.references.push(Reference {
-                            from: imp.symbol_id,
-                            to: def_id,
-                            kind: RefKind::ReExport,
-                            environment: Environment::Universal,
-                        });
+                    if let Some(&def_id) = name_in_module
+                        .get(&(target_module_id, imp.local_name.clone()))
+                        .filter(|&&id| program.symbols[id].kind != SymbolKind::Import)
+                    {
+                        edges.push(imp.symbol_id, def_id, RefKind::ReExport);
+                        linked = true;
                     }
                 }
+                // A default import that names no definition is the module's anonymous
+                // default export (`export default { ... }`, `export default connect(...)`),
+                // which is the whole module as far as this analysis can tell.
+                if !linked && imp.is_default {
+                    whole_module_uses.push((imp.symbol_id, target_module_id));
+                }
+                // Importing a module runs it, so it is reachable whenever the import is
+                // (pushed after the definition edge so that stays the import's first edge).
+                edges.push(imp.symbol_id, target_module_id, RefKind::ReExport);
             }
         }
+
+        // Pass: resolve `const X = defineAsyncComponent(() => import(
+        // './X.vue'))` bindings the same way a static import resolves, but
+        // as a `Dynamic` edge -- this genuinely is a runtime code-split
+        // boundary, not a statically-guaranteed-present import. Mirrors
+        // `spectograph_js`'s copy of this pass exactly, differing only in
+        // that `parsed`'s file keys are already `PathBuf` here and
+        // `resolve_module_path` takes a project resolver instead of a
+        // browser-field map.
+        for (path, result) in &parsed {
+            let base = path.parent().unwrap_or(path);
+            for reg in &result.vue_async_components {
+                let Some(source_path) = resolve_module_path(base, &reg.source, &resolver) else {
+                    continue;
+                };
+                let source_path_str = normalize_path(&source_path).to_string_lossy().into_owned();
+                let Some(&target_module_id) = module_paths.get(&source_path_str) else {
+                    continue;
+                };
+                let Some(target_component_id) = parsed
+                    .iter()
+                    .find(|(_p, r)| r.module_id == target_module_id)
+                    .and_then(|(_p, r)| r.vue_component.as_ref())
+                    .map(|c| c.symbol_id)
+                else {
+                    continue;
+                };
+                let Some(local_const_id) = result
+                    .symbols
+                    .iter()
+                    .find(|s| s.name == reg.local_name && s.kind == SymbolKind::Const)
+                    .map(|s| s.id)
+                else {
+                    continue;
+                };
+                edges.push(local_const_id, target_component_id, RefKind::Dynamic);
+            }
+        }
+        drop(edges);
 
         // Pass: Angular template usage (component/directive tags and
         // attributes, pipe names) -> reachability edges. Project-wide, unlike
@@ -840,50 +929,6 @@ impl TypeScriptAnalyzer {
                 kind: RefKind::Static,
                 environment: Environment::Universal,
             });
-        }
-
-        // Pass: resolve `const X = defineAsyncComponent(() => import(
-        // './X.vue'))` bindings the same way a static import resolves, but
-        // as a `Dynamic` edge -- this genuinely is a runtime code-split
-        // boundary, not a statically-guaranteed-present import. Mirrors
-        // `spectograph_js`'s copy of this pass exactly, differing only in
-        // that `parsed`'s file keys are already `PathBuf` here and
-        // `resolve_module_path` takes `root`/`tsconfig` instead of a
-        // browser-field map.
-        for (path, result) in &parsed {
-            let base = path.parent().unwrap_or(path);
-            for reg in &result.vue_async_components {
-                let Some(source_path) = resolve_module_path(base, &reg.source, root, &tsconfig)
-                else {
-                    continue;
-                };
-                let source_path_str = source_path.to_string_lossy().into_owned();
-                let Some(&target_module_id) = module_paths.get(&source_path_str) else {
-                    continue;
-                };
-                let Some(target_component_id) = parsed
-                    .iter()
-                    .find(|(_p, r)| r.module_id == target_module_id)
-                    .and_then(|(_p, r)| r.vue_component.as_ref())
-                    .map(|c| c.symbol_id)
-                else {
-                    continue;
-                };
-                let Some(local_const_id) = result
-                    .symbols
-                    .iter()
-                    .find(|s| s.name == reg.local_name && s.kind == SymbolKind::Const)
-                    .map(|s| s.id)
-                else {
-                    continue;
-                };
-                program.references.push(Reference {
-                    from: local_const_id,
-                    to: target_component_id,
-                    kind: RefKind::Dynamic,
-                    environment: Environment::Universal,
-                });
-            }
         }
 
         // Pass: Vue template usage (component tags, `:is` dynamic bindings)
@@ -930,23 +975,37 @@ impl TypeScriptAnalyzer {
                     environment: Environment::Universal,
                 });
             }
+
+            // Script bindings (handlers, state, imported components) named in a template.
+            template_bindings::add_template_binding_edges(&mut program, &sites);
         }
 
-        program.entrypoints = entrypoints::detect_entrypoint_symbols(&program, root);
+        let detection = detect_entries(&program, root);
+        program.entrypoints = detection.entrypoints;
 
         // A `createApp(...).mount(...)` file is always the app's real
         // entrypoint, whatever its name or `package.json`'s `main` field
-        // say -- added on top of (not instead of) the detection above.
-        // Especially relevant here: TS's entrypoint detection is far more
-        // restrictive than JS's permissive "every module" fallback (see
-        // `entrypoints::detect_entrypoint_symbols`'s own doc comment), so a
-        // Vue bootstrap file that isn't named `main.ts`/`index.ts` and
-        // isn't `package.json`'s `main` would otherwise be missed entirely.
+        // say -- added on top of (not instead of) the detection above, so a
+        // Vue bootstrap file that isn't named `main.ts`/`index.ts` and isn't
+        // `package.json`'s `main` is never missed.
         for (_path, result) in &parsed {
             if result.vue_app_mount && !program.entrypoints.contains(&result.module_id) {
                 program.entrypoints.push(result.module_id);
             }
         }
+
+        // Exported declarations of public-API entry modules, and of modules used as a whole
+        // (`export *`, `import * as`, `import()`), are used from outside the analyzed code.
+        exports::add_export_edges(
+            &mut program,
+            &exported_by_module,
+            &detection.api_roots,
+            &whole_module_uses,
+        );
+
+        // Constructors, framework lifecycle methods, overrides of external base classes,
+        // and `React` under the classic JSX transform.
+        implicit::add_implicit_edges(&mut program, &file_sources);
 
         Ok((program, parsed))
     }
@@ -959,5 +1018,12 @@ impl Analyzer for TypeScriptAnalyzer {
 
     fn analyze(&self, root: &Path) -> Result<Program, AnalyzeError> {
         self.analyze_impl(root).map(|(program, _parsed)| program)
+    }
+
+    fn analyze_with_diagnostics(
+        &self,
+        root: &Path,
+    ) -> Result<(Program, Vec<Diagnostic>), AnalyzeError> {
+        self.analyze_full(root, ResolutionMode::Static, None, 0)
     }
 }

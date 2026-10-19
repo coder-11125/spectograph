@@ -193,20 +193,57 @@ pub struct SfcFile {
     pub script_setup: Option<ScriptBlock>,
 }
 
-/// Matches one `<template ...>...</template>` block. Non-greedy body
-/// capture, `(?s)` so `.` crosses lines. SFC top-level blocks don't nest
-/// inside each other, so a straightforward "up to the first matching close
-/// tag" match is sufficient -- same "good enough for the actual shape in
-/// practice" tradeoff as `spectograph_ts::angular`'s regex-based template
-/// scanner, rather than pulling in a full HTML/XML parser. Two separate
-/// regexes rather than one `<(template|script)>...</\1>` alternation: the
-/// `regex` crate doesn't support backreferences.
-fn template_re() -> &'static Regex {
+/// Matches a `<template ...>` opening tag. Only the opening tag is a regex:
+/// where the block *ends* depends on nesting (`<template #fallback>` /
+/// `<template v-if>` inside the root template), which a regex can't count --
+/// see [`find_template_close`].
+fn template_open_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"(?s)<template((?:\s+[^>]*)?)>(.*?)</template>").unwrap())
+    RE.get_or_init(|| Regex::new(r"<template((?:\s+[^>]*)?)>").unwrap())
 }
 
-/// Matches one `<script ...>...</script>` block. See [`template_re`].
+/// Byte offset of the `</template>` that closes the root `<template>` whose body starts at
+/// `body_start`, counting nested `<template ...>` elements (slots, `v-if`/`v-for`
+/// wrappers) so the first inner `</template>` doesn't end the block early. Self-closing
+/// `<template ... />` doesn't open a level. `None` if the block is never closed.
+fn find_template_close(src: &str, body_start: usize) -> Option<usize> {
+    let mut depth = 1usize;
+    let mut i = body_start;
+    while let Some(rel) = src[i..].find('<') {
+        let at = i + rel;
+        let rest = &src[at..];
+        if let Some(after) = rest.strip_prefix("</template") {
+            if after.starts_with(|c: char| c == '>' || c.is_whitespace()) {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(at);
+                }
+            }
+            i = at + "</template".len();
+        } else if let Some(after) = rest.strip_prefix("<template") {
+            if after.starts_with(|c: char| c == '>' || c == '/' || c.is_whitespace()) {
+                // Find this tag's end and see whether it self-closes.
+                let tag_end = rest.find('>').map(|e| at + e)?;
+                if !src[..tag_end].ends_with('/') {
+                    depth += 1;
+                }
+                i = tag_end + 1;
+            } else {
+                i = at + "<template".len();
+            }
+        } else {
+            i = at + 1;
+        }
+    }
+    None
+}
+
+/// Matches one `<script ...>...</script>` block. Non-greedy body
+/// capture, `(?s)` so `.` crosses lines. Script blocks don't nest, so a
+/// straightforward "up to the first matching close tag" match is sufficient
+/// -- same "good enough for the actual shape in practice" tradeoff as
+/// `spectograph_ts::angular`'s regex-based template scanner, rather than
+/// pulling in a full HTML/XML parser.
 fn script_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| Regex::new(r"(?s)<script((?:\s+[^>]*)?)>(.*?)</script>").unwrap())
@@ -240,12 +277,14 @@ fn line_at(src: &str, at: usize) -> usize {
 pub fn parse_sfc(src: &str) -> SfcFile {
     let mut sfc = SfcFile::default();
 
-    if let Some(caps) = template_re().captures(src) {
-        let body = caps.get(2).unwrap();
-        sfc.template = Some(TemplateBlock {
-            content: body.as_str().to_string(),
-            start_line: line_at(src, body.start()),
-        });
+    if let Some(open) = template_open_re().find(src) {
+        let body_start = open.end();
+        if let Some(body_end) = find_template_close(src, body_start) {
+            sfc.template = Some(TemplateBlock {
+                content: src[body_start..body_end].to_string(),
+                start_line: line_at(src, body_start),
+            });
+        }
     }
 
     for caps in script_re().captures_iter(src) {
@@ -711,7 +750,7 @@ pub struct VueBindingMismatch {
     pub line: usize,
 }
 
-/// Flag template usage sites that pass a prop/event the target component
+/// Flag template usage sites that pass a prop/emit the target component
 /// doesn't declare. Only checks targets whose props/emits were statically
 /// enumerable (a non-empty `declared_props`/`declared_emits`); a target
 /// with none is skipped entirely for that half of the check -- can't tell
@@ -846,6 +885,36 @@ mod tests {
         assert!(!script.setup);
         assert_eq!(script.start_line, 5, "line of the <script> tag itself");
         assert!(sfc.script_setup.is_none());
+    }
+
+    #[test]
+    fn nested_template_elements_do_not_end_the_root_template_early() {
+        // Slots (`<template #fallback>`) and `v-if`/`v-for` wrappers are nested
+        // `<template>` elements; the root block ends at the *matching* close tag, so
+        // everything after the first inner `</template>` is still part of it.
+        let src = "<template>\n  <Suspense>\n    <A />\n    <template #fallback>loading</template>\n  </Suspense>\n  <Suspense>\n    <B />\n    <template #fallback><template v-if=\"x\">deep</template></template>\n  </Suspense>\n</template>\n<script setup>\n</script>\n";
+        let sfc = parse_sfc(src);
+        let template = sfc.template.expect("template block").content;
+        assert!(template.contains("<A />"));
+        assert!(
+            template.contains("<B />"),
+            "content after the first nested </template> was cut off: {template:?}"
+        );
+        assert!(template.trim_end().ends_with("</Suspense>"));
+        // And the script block after it is still found.
+        assert!(sfc.script_setup.is_some());
+    }
+
+    #[test]
+    fn self_closing_template_does_not_open_a_nesting_level() {
+        let src = "<template>\n  <template v-if=\"x\" />\n  <C />\n</template>\n";
+        let template = parse_sfc(src).template.expect("template block").content;
+        assert!(template.contains("<C />"));
+    }
+
+    #[test]
+    fn unclosed_template_yields_no_block() {
+        assert!(parse_sfc("<template>\n  <div/>\n").template.is_none());
     }
 
     #[test]

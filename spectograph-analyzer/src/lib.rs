@@ -8,6 +8,7 @@ pub mod discover;
 use std::path::Path;
 
 use spectograph_core::cost::{Cost, CostModel, CostSource};
+use spectograph_core::diagnostic::Diagnostic;
 use spectograph_core::ir::{Language, Program};
 
 /// Errors produced while analyzing source.
@@ -33,6 +34,16 @@ pub trait Analyzer {
     /// [`Program`] must set `entrypoints` appropriately for reachability analysis.
     fn analyze(&self, root: &Path) -> Result<Program, AnalyzeError>;
 
+    /// Like [`Analyzer::analyze`], but also returns framework-level diagnostics (prop and
+    /// binding mismatches, ...) collected in the same pass. The default has none; analyzers
+    /// with framework support override it.
+    fn analyze_with_diagnostics(
+        &self,
+        root: &Path,
+    ) -> Result<(Program, Vec<Diagnostic>), AnalyzeError> {
+        Ok((self.analyze(root)?, Vec::new()))
+    }
+
     /// Build a cost model for the program. Default: static estimate.
     ///
     /// Runtime profiling implementations should override this and return
@@ -40,9 +51,18 @@ pub trait Analyzer {
     /// (entry/test command) is available.
     fn cost_model(&self, program: &Program) -> CostModel {
         let mut model = CostModel::build(program, CostSource::Estimated);
+
+        // Count every incoming reference (certain or not) per symbol in one pass.
+        let mut incoming = vec![0u32; program.symbols.len()];
+        for r in &program.references {
+            if let Some(count) = incoming.get_mut(r.to) {
+                *count += 1;
+            }
+        }
+
         for sym in &program.symbols {
             let cost = model.cost_of(sym.id);
-            let imports = program.incoming(sym.id).count() as f64;
+            let imports = incoming.get(sym.id).copied().unwrap_or(0) as f64;
             model.costs.insert(
                 sym.id,
                 Cost {

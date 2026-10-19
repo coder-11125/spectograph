@@ -4,125 +4,85 @@ Find where bloat lives. Per-language static + runtime analysis that attributes c
 every symbol, ranks bloat as a cost-per-usage ratio, and drives a safety-isolated agent
 loop that refactors a codebase lean, verified by smoke tests and CI.
 
-See [`DESIGN.md`](DESIGN.md) for the full design contract.
+See [`DESIGN.md`](DESIGN.md) for the full design contract, [`docs/accuracy.md`](docs/accuracy.md)
+for measured accuracy and known limitations, [`docs/json-schema.md`](docs/json-schema.md) for
+the JSON contract, and [`CHANGELOG.md`](CHANGELOG.md).
 
 ## Status
 
-This is a working **vertical slice**: a Rust workspace where each language analyzer parses
-source with tree-sitter into a shared IR, and `spectograph check` reports bloat as
-human-readable CLI output or versioned JSON. Three languages are implemented —
-**Python**, **JavaScript**, and **TypeScript**.
+`spectograph check` is implemented for **Python**, **JavaScript** and **TypeScript**
+(including React, Angular and Vue). JS/TS has been hardened against real projects (express,
+commander, got, a Next.js app, Vue 3 apps, vuejs/core, facebook/react); see
+`docs/accuracy.md` for the numbers. `spectograph fix` is **not implemented** and exits 2.
 
 Implemented:
-- Cargo workspace with `core`, `analyzer`, `cli`, `py`, `js`, `ts`, `tsserver` crates.
-- Language-agnostic IR: symbols, references (with uncertainty), entrypoints, exports,
-  runtime environment (`Universal`/`Node`/`Browser`) inference.
-- Cost/usage model and tiered bloat classification.
-- Reachability from entrypoints (per-language conventions: Python's `__main__` guards,
-  `__init__.py` package roots, `pyproject.toml` console scripts; JS/TS's `package.json`
-  `main`/`bin`/`browser`/`exports`, conventional `index`/`main` files; Vue's
-  `createApp(...).mount(...)` bootstrap convention).
-- **Python** (`spectograph-py`): scope/shadowing, import aliasing, dynamic constructs
-  marked uncertain (star imports, `getattr`, `__import__`), class method/attribute
-  resolution (`self.method()`, `obj.method()`, constructor `__init__`), relative-import
-  resolution, inheritance (`super().method()`, subclassing), `__init__.py` re-exports and
-  `__all__` as public API. Optional **type-aware resolution** via basedpyright
-  (`--resolution pyright`): shells out to the LSP server for find-references, resolving
-  `obj.method()` by real type instead of name.
-- **JavaScript** (`spectograph-js`): CommonJS (`require`/`module.exports`) and ES module
-  resolution (default/named/namespace imports and re-exports), `node_modules`
-  package-entry resolution (`exports`/`main` fields), bundler `browser`-field remapping,
-  npm package recognition, environment-guard inference.
-- **TypeScript** (`spectograph-ts`): everything JS has, plus `tsconfig.json`
-  `baseUrl`/`paths` alias resolution and `include`/`exclude` filtering, decorator
-  metadata capture, constructor-parameter dependency-injection edges. Optional
-  **type-aware resolution** via `typescript-language-server` (`--resolution tsserver`,
-  also usable for plain JavaScript with `allowJs`/`checkJs`) through the shared
-  `spectograph-tsserver` client.
-- **Framework support**, layered additively on the JS/TS symbol graph (a component is
-  still an ordinary symbol; framework facts are extra data collected in the same parse
-  pass) — library APIs only, not yet wired into the `check` CLI output:
-  - **React** (JS + TS): function/class component detection, JSX usage sites, hook
-    calls, prop-mismatch checking, `forwardRef`/`memo` unwrapping.
-  - **Angular** (TS only): `@Component`/`@NgModule` decorator metadata, template
-    scanning (component/directive/pipe usage, inline or `templateUrl`), DI edges,
-    input/output binding-mismatch checking.
-  - **Vue** (JS + TS): `.vue` Single-File Component parsing (`<script>`/
-    `<script setup>` splitting with line-accurate reassembly), Options API and
-    Composition API component detection (`defineProps`/`defineEmits`, including TS's
-    generic form), template-usage reachability edges (kebab/PascalCase tag matching,
-    `<component :is>`, global `app.component(...)` registration,
-    `defineAsyncComponent` lazy-loading), prop/emit mismatch checking, and
-    `createApp(...).mount(...)` entrypoint detection.
-- `.gitignore`-aware file discovery.
-- `check` with `--format human|json`, `--fail-on <tier>`, and `--language` auto-detection.
+- Cargo workspace: `core`, `analyzer`, `cli`, `py`, `js`, `ts`, `tsserver`.
+- Language-agnostic IR; linear-time reachability from entrypoints; tiered classification
+  (🔴 guaranteed, 🟠 probable, 🟡 high-cost).
+- **Entrypoints & public API:** `package.json` `main`/`module`/`bin`/`exports`/`scripts`
+  (with `dist`→`src` remap), HTML `<script src>`, `angular.json`, monorepo packages, and
+  Next/Nuxt/SvelteKit/Remix/Astro/Gatsby/Angular conventions. Exports of entry modules count
+  as used from outside.
+- **Resolution:** CommonJS and ESM, `tsconfig`/`jsconfig` `paths`/`baseUrl`/`extends`,
+  `package.json` `imports`, workspace packages, `@/`-style aliases, TS `./x.js`→`x.ts`,
+  `node_modules` entries, `browser` field remapping, tsconfig `include`/`exclude`.
+- **Precision:** type refs, heritage clauses, default params, shorthand properties, member
+  access, implicit uses (constructors, lifecycle hooks, externally-extended classes).
+- **Frameworks** (additive on the same parse pass): React (components, JSX, hooks, prop
+  mismatches), Angular (decorators, templates, DI, binding mismatches), Vue (SFCs, template
+  usage and script bindings, prop/emit mismatches). Mismatches appear as `diagnostics`.
+- **Python:** scope/import aliasing, class/method resolution, inheritance, `__init__.py`
+  and `__all__`, optional basedpyright resolution.
+- Optional type-aware resolution via `typescript-language-server`.
+- `.gitignore`-aware discovery; root-relative `/`-separated report paths; deterministic output.
+- CI (`.github/workflows/ci.yml`) and tag-triggered release builds (`release.yml`) — written
+  but not yet verified on GitHub.
 
-Not yet implemented (roadmap, per `DESIGN.md`):
-- `fix` (agent loop + worktree isolation + smoke/CI gate).
-- Runtime profiling, AI providers, incremental SQLite index for large repos.
-- Wiring React/Angular/Vue framework findings (prop/binding mismatches) into `check`'s
-  CLI output — currently only reachable as library APIs (`analyze_react`,
-  `analyze_angular`, `analyze_vue`/`analyze_vue_mismatches`).
-- Remaining languages: Go, Rust, Java, Kotlin, C, C++, Ruby.
+Not yet implemented (see `DESIGN.md` checklist):
+- `fix` (agent loop, worktree isolation, gates); runtime profiling; AI providers;
+  incremental index.
+- Flow syntax support, parallel parsing.
+- Go, Rust, Java, Kotlin, C, C++, Ruby.
 
 ## Usage
 
 ```sh
-# Human-readable report (default; language auto-detected from the root)
-cargo run -p spectograph-cli -- check .
-
-# Explicit language
-cargo run -p spectograph-cli -- check . --language typescript
-
-# Versioned JSON for CI
-cargo run -p spectograph-cli -- check . --format json
-
-# Fail the build only on guaranteed bloat
-cargo run -p spectograph-cli -- check . --fail-on guaranteed
-
-# Type-aware resolution via basedpyright (needs basedpyright on PATH)
-cargo run -p spectograph-cli -- check . --resolution pyright
-
-# Point at a specific basedpyright LSP server executable
-cargo run -p spectograph-cli -- check . --resolution pyright --pyright-executable /path/to/basedpyright-langserver
-
-# Type-aware resolution via typescript-language-server (TypeScript, or JavaScript with allowJs/checkJs)
-cargo run -p spectograph-cli -- check . --resolution tsserver
+cargo run -p spectograph-cli -- check .                         # human report, language auto-detected
+cargo run -p spectograph-cli -- check . --language typescript   # explicit language
+cargo run -p spectograph-cli -- check . --format json           # versioned JSON for CI
+cargo run -p spectograph-cli -- check . --fail-on guaranteed    # fail only on 🔴
+cargo run -p spectograph-cli -- check . --fail-on-diagnostics   # also fail on framework mismatches
+cargo run -p spectograph-cli -- check . --resolution pyright    # basedpyright (needs it on PATH)
+cargo run -p spectograph-cli -- check . --resolution tsserver   # typescript-language-server
 ```
 
-Exit code is nonzero when bloat at or above `--fail-on` tier is found.
+`--pyright-executable` / `--tsserver-executable` point at a specific server binary.
+
+**Exit codes:** `0` clean · `1` findings at or above `--fail-on` (or diagnostics with
+`--fail-on-diagnostics`) · `2` error (including `fix`, which is not implemented).
+
+JSON output is versioned (`schema_version: 1`); see [`docs/json-schema.md`](docs/json-schema.md).
+
+## Accuracy benchmark
+
+```sh
+cargo build --release
+python3 scripts/bench.py
+```
+
+Clones eight real projects and prints findings per tier. See `docs/accuracy.md`.
 
 ## Fixtures
 
-Real Python and JavaScript sample projects live under `fixtures/python/` and
-`fixtures/javascript/`, exercised by `tests/fixtures.rs` in `spectograph-py` and
-`spectograph-js` respectively, which assert which symbols are reachable and which are dead:
+`fixtures/python/` and `fixtures/javascript/` hold older directory-based fixtures exercised
+by `tests/fixtures.rs`. Don't add new ones: new tests write their sources inline via
+`tempdir()` + `std::fs::write(...)` next to the assertions (as all of `spectograph-ts` does).
+`.gitattributes` keeps fixtures out of GitHub's language statistics.
 
-- `fixtures/python/python-sample` — entrypoint + dead code / unused imports
-- `fixtures/python/python-pkg` — `__init__.py` re-exports and `__all__`
-- `fixtures/python/python-scripts` — `pyproject.toml` console-script entrypoints
-- `fixtures/python/python-classes` — method/attribute resolution
-- `fixtures/python/python-relative` — relative imports
-- `fixtures/python/python-inheritance` — `super()`/inheritance
-- `fixtures/javascript/js-sample`, `js-pkg`, `js-commonjs`, `js-node-modules`,
-  `js-package-main`, `js-relative`, `js-index`, `js-classes`, `js-inheritance`,
-  `js-dynamic` — import resolution, CommonJS/ESM interop, `node_modules`/`package.json`
-  entry resolution, inheritance, dynamic-import uncertainty.
-
-Keeping these as versioned, test-backed fixtures ensures the sample code does not inflate
-the repo's language breakdown while still being load-bearing. A `.gitattributes` file marks
-the fixtures as generated code to further prevent them from affecting GitHub's language
-statistics.
-
-`spectograph-ts` has no equivalent `fixtures/typescript/` directory by design: its test
-suite (and every framework-support suite added since — React, Angular, Vue, dependency
-injection, decorators) writes each test's source files inline via `tempdir()` +
-`std::fs::write(...)` right next to the assertions, rather than as committed fixtures.
-Prefer that pattern for new tests.
-
-## Tests
+## Development
 
 ```sh
+git config core.hooksPath .githooks   # pre-commit runs cargo fmt
 cargo test --workspace
 cargo clippy --workspace --all-targets
 ```
@@ -131,12 +91,12 @@ cargo clippy --workspace --all-targets
 
 | Crate | Purpose |
 |---|---|
-| `spectograph-core` | IR, cost model, bloat analysis, reporting |
+| `spectograph-core` | IR, cost model, reachability/bloat analysis, reporting, diagnostics |
 | `spectograph-analyzer` | `Analyzer` trait + gitignore-aware discovery |
-| `spectograph-cli` | `spectograph` binary (`check` / `fix`) |
+| `spectograph-cli` | `spectograph` binary (`check` / `fix` stub) |
 | `spectograph-py` | Python analyzer (tree-sitter + optional basedpyright) |
-| `spectograph-js` | JavaScript analyzer (tree-sitter); shared React/Vue support |
-| `spectograph-ts` | TypeScript analyzer (tree-sitter); Angular support; reuses React/Vue support from `spectograph-js` |
-| `spectograph-tsserver` | Shared `typescript-language-server` LSP client, used by both `spectograph-js` and `spectograph-ts` |
+| `spectograph-js` | JavaScript analyzer; shared resolution, entrypoints, exports, implicit uses, React/Vue |
+| `spectograph-ts` | TypeScript analyzer; Angular; reuses `spectograph-js` shared modules |
+| `spectograph-tsserver` | Shared `typescript-language-server` LSP client |
 
 Each `spectograph-<lang>` crate emits a shared `Program`; all bloat logic lives in `core`.
