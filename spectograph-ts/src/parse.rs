@@ -31,6 +31,10 @@ impl Scopes {
     fn pop(&mut self) {
         self.stack.pop();
     }
+    /// Nesting depth: 1 at module level, more inside functions/classes.
+    fn depth(&self) -> usize {
+        self.stack.len()
+    }
     fn declare(&mut self, name: &str, binding: Binding) {
         if let Some(top) = self.stack.last_mut() {
             top.insert(name.to_string(), binding);
@@ -51,6 +55,10 @@ pub struct FileResult {
     pub symbols: Vec<Symbol>,
     pub refs: Vec<UnresolvedRef>,
     pub imports: Vec<ImportDecl>,
+    /// Declarations carrying an `export` keyword (functions, classes, consts, types, and
+    /// the members of exported classes/enums). Used to make a module's exports reachable
+    /// when the module is used as a whole or is a public API entrypoint.
+    pub exported: Vec<SymbolId>,
     pub decorators: Vec<DecoratorInfo>,
     pub components: Vec<ReactComponent>,
     pub jsx_usages: Vec<JsxUsage>,
@@ -69,6 +77,18 @@ pub struct FileResult {
 pub enum RefTarget {
     Symbol(SymbolId),
     Name(String),
+    /// A property access (`obj.run`, `Color.Red`, `this.#cache`): resolved by *member
+    /// name* to every class/enum member symbol (`Service.run`, `Color.Red`, ...) or exported
+    /// symbol with that short name. Without type information the receiver is unknown, so
+    /// this is the conservative reading: if any member of that name is accessed anywhere,
+    /// none of them is reported dead.
+    Member(String),
+    /// Executing another module for its side effects (`import './polyfills'`): the module
+    /// becomes reachable, its exports are not thereby used.
+    Module(String),
+    /// Using another module's namespace as a value (`import('./page')`, a bare
+    /// `require('./routes')`): the module and all its exports are used.
+    ModuleNamespace(String),
 }
 
 pub struct UnresolvedRef {
@@ -205,6 +225,7 @@ pub fn parse_file(
         &mut angular_selectors,
         &mut angular_pipes,
     );
+    let mut exported = collect_exported(root, &symbols);
     collect_refs(root, src, module_id, &mut scopes, &mut refs);
     refs.extend(collect_react_lifecycle_edges(root, src, &symbols));
 
@@ -230,12 +251,17 @@ pub fn parse_file(
         // that ever overrides it.
         symbols[0].environment = Environment::Browser;
     }
+    // A `.vue` file's component *is* its default export.
+    if let Some(component) = &vue_component {
+        exported.push(component.symbol_id);
+    }
 
     FileResult {
         module_id,
         symbols,
         refs,
         imports,
+        exported,
         decorators,
         components,
         jsx_usages,
@@ -247,6 +273,38 @@ pub fn parse_file(
         vue_async_components,
         vue_app_mount,
     }
+}
+
+/// Ids of the declarations that sit inside a top-level `export ...` statement (plus the
+/// members of exported classes/enums, which lie within the declaration's span).
+fn collect_exported(root: Node, symbols: &[Symbol]) -> Vec<SymbolId> {
+    let mut out = Vec::new();
+    let mut cursor = root.walk();
+    for child in root.named_children(&mut cursor) {
+        if child.kind() != "export_statement" {
+            continue;
+        }
+        let Some(decl) = child.child_by_field_name("declaration") else {
+            continue;
+        };
+        // Symbol spans are line/column, so compare against the node's own row/column.
+        let (start, end) = (decl.start_position(), decl.end_position());
+        for s in symbols {
+            if !matches!(
+                s.kind,
+                SymbolKind::Function | SymbolKind::Class | SymbolKind::Const | SymbolKind::Type
+            ) {
+                continue;
+            }
+            let at = (s.span.start_line - 1, s.span.start_col - 1);
+            if at >= (start.row, start.column) && at <= (end.row, end.column) {
+                out.push(s.id);
+            }
+        }
+    }
+    out.sort_unstable();
+    out.dedup();
+    out
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -308,7 +366,7 @@ fn collect_globals(
                     symbols.push(symbol(id, &name, SymbolKind::Function, path, decl));
                 }
             }
-            "class_declaration" => {
+            "class_declaration" | "abstract_class_declaration" => {
                 if let Some(name_node) = decl.child_by_field_name("name") {
                     let name = node_text(name_node, src.as_bytes()).to_string();
                     let id = *next_id;
@@ -1249,6 +1307,53 @@ fn collect_refs(
     }
 }
 
+/// Record a reference from `enclosing` to whatever `name` resolves to in `scopes`.
+/// `fall_back_to_name` controls what happens to a name no scope knows: expression
+/// identifiers retry by project-wide name (a `Dynamic`, uncertain edge), while type names
+/// don't -- an unresolved type is a builtin (`Promise`, `Record`) or a generic parameter.
+fn push_name_ref(
+    name: &str,
+    enclosing: SymbolId,
+    scopes: &Scopes,
+    refs: &mut Vec<UnresolvedRef>,
+    fall_back_to_name: bool,
+) {
+    match scopes.resolve(name) {
+        Some(Binding::Global(id)) if id != enclosing => {
+            refs.push(UnresolvedRef {
+                from: enclosing,
+                target: RefTarget::Symbol(id),
+                kind: RefKind::Static,
+            });
+        }
+        Some(Binding::Global(_)) | Some(Binding::Local) => {}
+        None if fall_back_to_name => {
+            refs.push(UnresolvedRef {
+                from: enclosing,
+                target: RefTarget::Name(name.to_string()),
+                kind: RefKind::Dynamic,
+            });
+        }
+        None => {}
+    }
+}
+
+/// The string-literal specifier of an `import('x')` / `require('x')` call, if `call` is one.
+fn module_call_specifier(call: Node, src: &str) -> Option<String> {
+    let func = call.child_by_field_name("function")?;
+    let is_loader = func.kind() == "import"
+        || (func.kind() == "identifier" && node_text(func, src.as_bytes()) == "require");
+    if !is_loader {
+        return None;
+    }
+    let arg = call.child_by_field_name("arguments")?.named_child(0)?;
+    if arg.kind() != "string" {
+        return None;
+    }
+    let spec = strip_quotes(node_text(arg, src.as_bytes()));
+    (!spec.is_empty()).then_some(spec)
+}
+
 fn walk_node(
     node: Node,
     src: &str,
@@ -1258,9 +1363,22 @@ fn walk_node(
 ) {
     match node.kind() {
         "import_statement" => {
-            // Already fully handled by `handle_import_statement` during
-            // `collect_globals` (covers both `import ... from` and TS's
-            // `import x = require(...)`); nothing left to walk.
+            // Bindings are fully handled by `handle_import_statement` during
+            // `collect_globals` (both `import ... from` and TS's `import x = require(...)`).
+            // A bare `import './polyfills'` binds nothing but still runs the module.
+            let mut c = node.walk();
+            let has_bindings = node
+                .named_children(&mut c)
+                .any(|n| matches!(n.kind(), "import_clause" | "import_require_clause"));
+            if !has_bindings {
+                if let Some(source) = node.child_by_field_name("source") {
+                    refs.push(UnresolvedRef {
+                        from: enclosing,
+                        target: RefTarget::Module(strip_quotes(node_text(source, src.as_bytes()))),
+                        kind: RefKind::Static,
+                    });
+                }
+            }
         }
         "export_statement" if node.child_by_field_name("source").is_some() => {
             // `export { a } from './mod'` etc: "a" names something in the *other*
@@ -1268,72 +1386,159 @@ fn walk_node(
             // `handle_export_statement`. Walking it here would risk resolving it
             // against an unrelated same-named local symbol.
         }
-        "class_declaration" => {
-            if let Some(name_node) = node.child_by_field_name("name") {
-                let name = node_text(name_node, src.as_bytes()).to_string();
-                let def_id = resolve_def_id(node, src, scopes, enclosing);
-                scopes.push();
-                if !name.is_empty() {
-                    scopes.declare(&name, Binding::Local);
-                }
-                scopes.declare("this", Binding::Local);
-                if let Some(body) = node.child_by_field_name("body") {
-                    let mut c = body.walk();
-                    for child in body.named_children(&mut c) {
-                        walk_node(child, src, def_id, scopes, refs);
-                    }
-                }
-                scopes.pop();
-            }
-        }
-        "function_declaration" | "arrow_function" | "method_definition" => {
+        "class_declaration" | "abstract_class_declaration" => {
+            let name_node = node.child_by_field_name("name");
             let def_id = resolve_def_id(node, src, scopes, enclosing);
             scopes.push();
-            if let Some(name_node) = node.child_by_field_name("name") {
-                scopes.declare(node_text(name_node, src.as_bytes()), Binding::Local);
+            if let Some(n) = name_node {
+                let name = node_text(n, src.as_bytes());
+                if !name.is_empty() {
+                    scopes.declare(name, Binding::Local);
+                }
             }
-            if let Some(params) = node.child_by_field_name("parameters") {
-                bind_locals(params, src.as_bytes(), scopes);
-            }
-            if let Some(body) = node.child_by_field_name("body") {
-                let mut c = body.walk();
-                for child in body.named_children(&mut c) {
+            scopes.declare("this", Binding::Local);
+            let mut c = node.walk();
+            for child in node.named_children(&mut c) {
+                if name_node.is_some_and(|n| n.id() == child.id()) {
+                    continue;
+                }
+                if child.kind() == "class_body" {
+                    let mut bc = child.walk();
+                    for member in child.named_children(&mut bc) {
+                        walk_node(member, src, def_id, scopes, refs);
+                    }
+                } else {
+                    // `extends`/`implements` clauses, type parameters, decorators: the
+                    // class depends on everything they name.
                     walk_node(child, src, def_id, scopes, refs);
                 }
             }
             scopes.pop();
         }
+        "function_declaration"
+        | "generator_function_declaration"
+        | "function_expression"
+        | "generator_function"
+        | "arrow_function"
+        | "method_definition" => {
+            let name_node = node.child_by_field_name("name");
+            let def_id = resolve_def_id(node, src, scopes, enclosing);
+            scopes.push();
+            // A function's own name is visible inside it (recursion); a method's name is
+            // a property, not a binding, so it must not shadow an outer function.
+            if node.kind() != "method_definition" {
+                if let Some(n) = name_node {
+                    scopes.declare(node_text(n, src.as_bytes()), Binding::Local);
+                }
+            }
+            if let Some(params) = node.child_by_field_name("parameters") {
+                bind_locals(params, src.as_bytes(), scopes);
+            }
+            // `x => x` has a single bare `parameter` instead of a parameter list.
+            if let Some(param) = node.child_by_field_name("parameter") {
+                bind_locals(param, src.as_bytes(), scopes);
+            }
+            // Walk everything but the name: parameter types and defaults, the return
+            // type, type parameters, and the body (a statement block or a bare
+            // expression like `() => helper()`).
+            let mut c = node.walk();
+            for child in node.named_children(&mut c) {
+                if name_node.is_some_and(|n| n.id() == child.id()) {
+                    continue;
+                }
+                walk_node(child, src, def_id, scopes, refs);
+            }
+            scopes.pop();
+        }
+        "interface_declaration"
+        | "type_alias_declaration"
+        | "enum_declaration"
+        | "internal_module" => {
+            // The declared name is the declaration itself, not a use of it. Everything
+            // else (heritage, member types, enum initializers) is a dependency of the
+            // declaration.
+            let name_node = node.child_by_field_name("name");
+            let def_id = resolve_def_id(node, src, scopes, enclosing);
+            let mut c = node.walk();
+            for child in node.named_children(&mut c) {
+                if name_node.is_some_and(|n| n.id() == child.id()) {
+                    continue;
+                }
+                walk_node(child, src, def_id, scopes, refs);
+            }
+        }
         "assignment_expression" | "variable_declaration" | "lexical_declaration" => {
+            // Inside a function the declared names shadow outer ones; at module level
+            // they're already the file's globals.
+            let in_function = scopes.depth() > 1;
             let mut c = node.walk();
             for declarator in node.named_children(&mut c) {
                 if declarator.kind() == "variable_declarator" {
+                    if let Some(ty) = declarator.child_by_field_name("type") {
+                        walk_node(ty, src, enclosing, scopes, refs);
+                    }
                     if let Some(value) = declarator.child_by_field_name("value") {
                         walk_node(value, src, enclosing, scopes, refs);
+                    }
+                    if in_function {
+                        if let Some(name_node) = declarator.child_by_field_name("name") {
+                            bind_locals(name_node, src.as_bytes(), scopes);
+                        }
                     }
                 } else {
                     walk_node(declarator, src, enclosing, scopes, refs);
                 }
             }
         }
-        "identifier" => {
-            let name = node_text(node, src.as_bytes()).to_string();
-            match scopes.resolve(&name) {
-                Some(Binding::Global(id)) if id != enclosing => {
+        "call_expression" => {
+            // `import('./page')` / `require('./routes')`: statically resolvable, and the
+            // result is used as a value, so the whole module is in play.
+            if let Some(spec) = module_call_specifier(node, src) {
+                refs.push(UnresolvedRef {
+                    from: enclosing,
+                    target: RefTarget::ModuleNamespace(spec),
+                    kind: RefKind::Static,
+                });
+            }
+            let mut c = node.walk();
+            for child in node.named_children(&mut c) {
+                walk_node(child, src, enclosing, scopes, refs);
+            }
+        }
+        "member_expression" => {
+            if let Some(object) = node.child_by_field_name("object") {
+                walk_node(object, src, enclosing, scopes, refs);
+            }
+            if let Some(property) = node.child_by_field_name("property") {
+                if matches!(
+                    property.kind(),
+                    "property_identifier" | "private_property_identifier"
+                ) {
                     refs.push(UnresolvedRef {
                         from: enclosing,
-                        target: RefTarget::Symbol(id),
+                        target: RefTarget::Member(node_text(property, src.as_bytes()).to_string()),
                         kind: RefKind::Static,
                     });
                 }
-                Some(Binding::Global(_)) | Some(Binding::Local) => {}
-                None => {
-                    refs.push(UnresolvedRef {
-                        from: enclosing,
-                        target: RefTarget::Name(name),
-                        kind: RefKind::Dynamic,
-                    });
-                }
             }
+        }
+        "identifier" | "shorthand_property_identifier" => {
+            push_name_ref(
+                node_text(node, src.as_bytes()),
+                enclosing,
+                scopes,
+                refs,
+                true,
+            );
+        }
+        "type_identifier" => {
+            push_name_ref(
+                node_text(node, src.as_bytes()),
+                enclosing,
+                scopes,
+                refs,
+                false,
+            );
         }
         _ => {
             let mut c = node.walk();
@@ -1354,29 +1559,41 @@ fn resolve_def_id(node: Node, src: &str, scopes: &Scopes, enclosing: SymbolId) -
         .unwrap_or(enclosing)
 }
 
+/// Declare every name a binding pattern introduces as a local: parameters (whose type
+/// annotations and default values are *not* bindings), plain identifiers, and destructuring
+/// patterns -- including `{ a = DEFAULT, b: c = other }`, where only `a` and `c` are
+/// bindings and `DEFAULT`/`other` are ordinary expressions that must keep their references.
 fn bind_locals(node: Node, src: &[u8], scopes: &mut Scopes) {
     match node.kind() {
-        "identifier" | "required_parameter" | "optional_parameter" => {
-            // Parameters can carry a type annotation (`x: number`); only the
-            // pattern (name) part matters for scoping.
+        "identifier" | "shorthand_property_identifier_pattern" => {
+            scopes.declare(node_text(node, src), Binding::Local);
+        }
+        "required_parameter" | "optional_parameter" => {
+            // Parameters can carry a type annotation (`x: number`) and a default; only the
+            // pattern (name) part is a binding.
             if let Some(pattern) = node.child_by_field_name("pattern") {
                 bind_locals(pattern, src, scopes);
-            } else if node.kind() == "identifier" {
-                scopes.declare(node_text(node, src), Binding::Local);
             }
         }
-        "object_pattern" | "array_pattern" => {
+        // `a = 1` / `{ a = 1 }`: the left side is the binding, the right side an expression.
+        "assignment_pattern" | "object_assignment_pattern" => {
+            if let Some(left) = node.child_by_field_name("left") {
+                bind_locals(left, src, scopes);
+            }
+        }
+        // `{ key: local }`: the value side is the binding.
+        "pair_pattern" => {
+            if let Some(value) = node.child_by_field_name("value") {
+                bind_locals(value, src, scopes);
+            }
+        }
+        "formal_parameters" | "object_pattern" | "array_pattern" | "rest_pattern" => {
             let mut c = node.walk();
             for child in node.named_children(&mut c) {
                 bind_locals(child, src, scopes);
             }
         }
-        _ => {
-            let mut c = node.walk();
-            for child in node.named_children(&mut c) {
-                bind_locals(child, src, scopes);
-            }
-        }
+        _ => {}
     }
 }
 

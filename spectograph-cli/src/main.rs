@@ -1,7 +1,7 @@
 //! Spectograph CLI: `check` (read-only analysis) and `fix` (mutating, gated).
 //!
-//! Vertical slice currently wires `check` for Python end to end. `fix` is stubbed
-//! (agent loop + worktree isolation land in a later milestone).
+//! `check` is implemented for Python, JavaScript, and TypeScript. `fix` (agent loop +
+//! worktree isolation + smoke/CI gate) is not built yet and exits with an error.
 
 mod cli;
 mod run;
