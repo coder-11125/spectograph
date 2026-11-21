@@ -34,6 +34,8 @@ Implemented:
 - **Python:** scope/import aliasing, class/method resolution, inheritance, `__init__.py`
   and `__all__`, optional basedpyright resolution.
 - Optional type-aware resolution via `typescript-language-server`.
+- **Parallel parsing (JS/TS):** files are parsed on a large-stack rayon pool, then symbol ids
+  are relocated in input order, so output is identical to a sequential run.
 - `.gitignore`-aware discovery; root-relative `/`-separated report paths; deterministic output.
 - CI (`.github/workflows/ci.yml`) and tag-triggered release builds (`release.yml`) — written
   but not yet verified on GitHub.
@@ -41,7 +43,7 @@ Implemented:
 Not yet implemented (see `DESIGN.md` checklist):
 - `fix` (agent loop, worktree isolation, gates); runtime profiling; AI providers;
   incremental index.
-- Flow syntax support, parallel parsing.
+- Flow syntax support; parallel parsing for Python (JS/TS parse in parallel).
 - Go, Rust, Java, Kotlin, C, C++, Ruby.
 
 ## Usage
@@ -92,7 +94,7 @@ cargo clippy --workspace --all-targets
 | Crate | Purpose |
 |---|---|
 | `spectograph-core` | IR, cost model, reachability/bloat analysis, reporting, diagnostics |
-| `spectograph-analyzer` | `Analyzer` trait + gitignore-aware discovery |
+| `spectograph-analyzer` | `Analyzer` trait + gitignore-aware discovery + ordered parallel map |
 | `spectograph-cli` | `spectograph` binary (`check` / `fix` stub) |
 | `spectograph-py` | Python analyzer (tree-sitter + optional basedpyright) |
 | `spectograph-js` | JavaScript analyzer; shared resolution, entrypoints, exports, implicit uses, React/Vue |

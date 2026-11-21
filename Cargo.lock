@@ -534,6 +534,7 @@ name = "spectograph-analyzer"
 version = "0.1.0"
 dependencies = [
  "ignore",
+ "rayon",
  "spectograph-core",
  "thiserror",
 ]

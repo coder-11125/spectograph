@@ -78,6 +78,12 @@ Conventions used everywhere in resolution code:
   `implicit.rs` (constructors, protocol methods, lifecycle hooks, external bases, JSX
   `React`, `.d.ts`), `template_bindings.rs`, `diagnostics.rs`. Type-aware resolution lives in
   `spectograph-tsserver`.
+- **Parallel parsing (JS/TS).** Pass 1 parses files via `spectograph_analyzer::parallel::par_map`
+  (rayon, 32 MiB worker stacks since tree walks are recursive, sequential below 16 files) with
+  file-local ids (module = 0, members from 1), then `FileResult::shift_ids` (`shift.rs` in each
+  crate) relocates each result to its slot in input order, so ids are identical to a sequential
+  parse. **Any new `SymbolId`-bearing field added to `FileResult` (or a type it holds) must be
+  added to that crate's `shift_ids`**; `tests/parallel.rs` covers it. Python is still sequential.
 - Each `analyze_impl` runs fixed passes: parse every file → resolve in-file refs (with an
   `EdgeSink` dedupe) → resolve imports (plus a module edge) → Vue/Angular passes → entry
   detection → export edges → implicit edges. `analyze_with_resolution` swaps static call
@@ -104,7 +110,7 @@ New tests write sources **inline** via `tempdir()` + `std::fs::write(...)`. Don'
 ### Known limitations
 
 Flow syntax can't be parsed by tree-sitter-javascript (slow + noisy on e.g. facebook/react);
-member resolution is by name (precision-first); parsing is single-threaded. See
+member resolution is by name (precision-first); Python parsing is single-threaded. See
 `docs/accuracy.md`.
 
 ## Do's and Dont's

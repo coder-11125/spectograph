@@ -18,7 +18,8 @@ loop that refactors a codebase lean — verified by the project's own smoke test
 - [ ] `fix` agent loop, worktree isolation, smoke/CI gate (currently exits 2)
 - [ ] Runtime profiling cost signal (static estimate only today)
 - [ ] AI providers (`BloatAi`), uncertain-reference disambiguation
-- [ ] Incremental SQLite index for large repos; parallel parsing
+- [x] Parallel parsing for JS/TS (ordered, deterministic id relocation); Python still sequential
+- [ ] Incremental SQLite index for large repos
 - [ ] Flow syntax support (facebook/react-style code is noisy)
 - [ ] Go, Rust, Java, Kotlin, C, C++, Ruby analyzers
 
@@ -145,9 +146,11 @@ monotonic guard; per-iteration audit trail.
 
 ## 8. Scale
 
-Reachability is linear (200k-symbol test in CI). Parsing is single-threaded; large repos
-(facebook/react, ~32k symbols) take ~30s, dominated by tree-sitter error recovery on Flow
-syntax. Planned: parallel parsing, incremental SQLite index above ~50k LOC.
+Reachability is linear (200k-symbol test in CI). JS/TS parsing is parallel (file-local ids
+relocated in input order, so output is deterministic); Python parsing is still sequential.
+Large repos (facebook/react, ~32k symbols) took ~30s before parallelism, dominated by
+tree-sitter error recovery on Flow syntax (not re-measured since). Planned: incremental
+SQLite index above ~50k LOC, Python parallel parsing.
 
 ---
 

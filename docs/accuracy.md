@@ -56,7 +56,8 @@ react number is **not trustworthy** (see below).
   Flow code are noisy. TypeScript and plain JavaScript are unaffected.
 - **Member resolution is by name.** `x.run()` keeps every exported/class member named `run`
   alive. This hides some dead members (precision over recall).
-- **Parsing is single-threaded.**
+- **Python parsing is single-threaded** (JS/TS parse in parallel). The timings in the table
+  above predate parallel parsing and have not been re-measured.
 - **Windows** is exercised in CI as experimental only; the end-to-end suite has not been
   run there.
 - Dynamic constructs (`require(variable)`, `eval`, reflection) are never traversed and never

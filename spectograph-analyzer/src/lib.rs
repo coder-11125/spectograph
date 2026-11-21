@@ -4,6 +4,7 @@
 //! language-agnostic [`Program`] that `spectograph-core` can analyze.
 
 pub mod discover;
+pub mod parallel;
 
 use std::path::Path;
 

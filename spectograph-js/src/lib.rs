@@ -11,6 +11,7 @@ pub mod jsonc;
 pub mod parse;
 pub mod pathutil;
 pub mod react;
+pub mod shift;
 pub mod template_bindings;
 pub mod tsconfig;
 pub mod vue;
@@ -768,19 +769,25 @@ impl JavaScriptAnalyzer {
         // Bundler `browser` field remapping, applied during module resolution below.
         let browser_map = read_browser_map(root);
 
-        // Pass 1: parse each file, collect its symbols and unresolved refs.
+        // Pass 1: parse each file (in parallel, with file-local ids), then relocate each
+        // result to its slot in the project-wide id space in input order -- the ids come
+        // out exactly as a sequential parse would assign them.
+        let local_results =
+            spectograph_analyzer::parallel::par_map(&file_sources, |(path, src)| {
+                let mut local_next = 1usize;
+                let result = parse_file(
+                    path,
+                    src,
+                    0,
+                    &mut local_next,
+                    vue_script_setup_files.contains(path),
+                );
+                (result, local_next)
+            });
         let mut parsed: Vec<(String, parse::FileResult)> = Vec::new();
-        for (path, src) in &file_sources {
-            let module_id = next_id;
-            next_id += 1;
-
-            let result = parse_file(
-                path,
-                src,
-                module_id,
-                &mut next_id,
-                vue_script_setup_files.contains(path),
-            );
+        for ((path, _src), (mut result, id_count)) in file_sources.iter().zip(local_results) {
+            result.shift_ids(next_id);
+            next_id += id_count;
 
             for sym in &result.symbols {
                 if sym.kind != SymbolKind::Module {
