@@ -136,6 +136,10 @@ pub struct Frameworks {
     pub astro: bool,
     pub gatsby: bool,
     pub angular: bool,
+    /// A Vue file-based-routing/layout plugin (`vite-plugin-pages`, `unplugin-vue-router`,
+    /// `vite-plugin-vue-layouts`, ...): it generates routes from `src/pages/**` and wraps them
+    /// in `src/layouts/**`, so those files are loaded by the plugin, never imported.
+    pub vue_file_routing: bool,
 }
 
 impl Frameworks {
@@ -166,6 +170,12 @@ impl Frameworks {
             astro: any(&["astro"]),
             gatsby: any(&["gatsby"]),
             angular: any(&["@angular/core"]),
+            vue_file_routing: any(&[
+                "vite-plugin-pages",
+                "unplugin-vue-router",
+                "vite-plugin-vue-layouts",
+                "vite-plugin-vue-layouts-next",
+            ]),
         }
     }
 }
@@ -203,6 +213,9 @@ const TEST_MARKERS: &[&str] = &[
     "cy",
     "mock",
     "fixture",
+    // Vitest/tsd type-level tests: `foo.test-d.ts`.
+    "test-d",
+    "spec-d",
 ];
 
 /// Directories whose contents are tests, tooling, examples, or static assets: roots of usage
@@ -293,7 +306,9 @@ pub fn classify_path(rel: &str, fw: &Frameworks) -> Option<EntryClass> {
         return Some(EntryClass::Primary);
     }
 
-    if dirs.iter().any(|d| SECONDARY_DIRS.contains(d))
+    if dirs
+        .iter()
+        .any(|d| SECONDARY_DIRS.contains(d) || d.ends_with("-test") || d.ends_with("-tests"))
         || middle
             .iter()
             .any(|m| matches!(*m, "config" | "conf" | "setup" | "rc" | "worker"))
@@ -376,6 +391,17 @@ fn is_primary(dirs: &[&str], stem: &str, parts: &[&str], fw: &Frameworks) -> boo
             return true;
         }
         if (in_root || in_src || dirs == ["app"]) && matches!(stem, "app" | "error") {
+            return true;
+        }
+    }
+
+    if fw.vue_file_routing {
+        // Default folders of the file-routing and layout plugins: `src/pages/**`,
+        // `src/layouts/**` (or the same at the package root).
+        let base = if top == Some("src") { second } else { top };
+        if matches!(base, Some("pages") | Some("layouts"))
+            && dirs.len() > usize::from(top == Some("src"))
+        {
             return true;
         }
     }
@@ -1008,6 +1034,35 @@ mod tests {
             classify_path("src/pages/index.ts", &astro),
             Some(EntryClass::Primary)
         );
+    }
+
+    #[test]
+    fn vue_file_routing_plugins_make_pages_and_layouts_entrypoints() {
+        let json: Value = serde_json::from_str(
+            r#"{"devDependencies": {"unplugin-vue-router": "0.8", "vue": "3"}}"#,
+        )
+        .unwrap();
+        let fw = Frameworks::from_package_json(&json);
+        assert!(fw.vue_file_routing);
+        for path in [
+            "src/pages/index.vue",
+            "src/pages/users/[id].vue",
+            "pages/about.vue",
+            "src/layouts/default.vue",
+        ] {
+            assert_eq!(
+                classify_path(path, &fw),
+                Some(EntryClass::Primary),
+                "{path}"
+            );
+        }
+        // Without the plugin a `pages/` folder is just a folder.
+        assert_eq!(
+            classify_path("src/pages/index.vue", &Frameworks::default()),
+            None
+        );
+        // Only files inside the folders, not a sibling that merely shares the name prefix.
+        assert_eq!(classify_path("src/pagesx/a.vue", &fw), None);
     }
 
     #[test]

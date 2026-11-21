@@ -72,6 +72,9 @@ pub struct FileResult {
     /// bootstrap convention, used to mark it as an entrypoint independent
     /// of its filename/`package.json` (see [`vue::has_vue_app_mount`]).
     pub vue_app_mount: bool,
+    /// `import.meta.glob(...)` / `require.context(...)` bulk imports
+    /// (see [`spectograph_js::globs`]).
+    pub module_globs: Vec<spectograph_js::globs::ModuleGlob>,
 }
 
 pub enum RefTarget {
@@ -272,6 +275,7 @@ pub fn parse_file(
         vue_global_registrations,
         vue_async_components,
         vue_app_mount,
+        module_globs: spectograph_js::globs::collect_module_globs(root, src),
     }
 }
 
@@ -2036,11 +2040,11 @@ fn detect_react(
 /// (`const props = defineProps<{ label: string; count?: number }>()`), with
 /// no runtime argument at all. `T`'s member names are extracted the same way
 /// an interface/type-alias's declared props already are for typed React
-/// components -- see [`object_member_names`]. `defineEmits<T>()`'s older
-/// call-signature form (`{ (e: 'change', v: string): void }`) isn't handled
-/// -- `object_member_names` only reads `property_signature` members, so
-/// that shape yields an (indistinguishable-from-"didn't declare any") empty
-/// list rather than a wrong one.
+/// components -- see [`object_member_names`]. `defineEmits<T>()` additionally
+/// accepts the older call-signature form (`{ (e: 'change', v: string): void }`)
+/// and a function type (`(e: 'a' | 'b') => void`); `T` may also name a
+/// same-file interface/alias (one that doesn't `extends` anything), and the
+/// call may be wrapped in `withDefaults(...)` -- see [`macro_type_names`].
 ///
 /// `is_vue_script_setup` mirrors `spectograph_js::parse`'s copy of this
 /// function -- see its doc comment for why it's needed.
@@ -2058,6 +2062,11 @@ fn detect_vue_component(
 
     let mut declared_props = Vec::new();
     let mut declared_emits = Vec::new();
+    let mut registered_components: Vec<(String, String)> = Vec::new();
+    let mut inherits_bindings = false;
+    let mut model_names: Vec<String> = Vec::new();
+    let mut saw_props_macro = false;
+    let mut saw_emits_macro = false;
     let mut explicit_name: Option<String> = None;
     let mut anchor: Option<Node> = None;
 
@@ -2067,12 +2076,12 @@ fn detect_vue_component(
         if child.kind() != "export_statement" {
             continue;
         }
-        let Some(value) = child.child_by_field_name("value") else {
+        let Some(value) = child
+            .child_by_field_name("value")
+            .and_then(|v| vue::component_options_object(v, src.as_bytes()))
+        else {
             continue;
         };
-        if value.kind() != "object" {
-            continue;
-        }
         anchor = Some(child);
         let mut oc = value.walk();
         for prop in value.named_children(&mut oc) {
@@ -2099,6 +2108,15 @@ fn detect_vue_component(
                     declared_emits =
                         vue::extract_names_from_array_or_object(prop_value, src.as_bytes());
                 }
+                "components" => {
+                    registered_components.extend(vue::extract_component_registrations(
+                        prop_value,
+                        src.as_bytes(),
+                    ));
+                }
+                // Props/emits merged in from elsewhere: the component's own lists are only
+                // part of what it accepts.
+                "mixins" | "extends" => inherits_bindings = true,
                 _ => {}
             }
         }
@@ -2110,14 +2128,43 @@ fn detect_vue_component(
     // block contributed these lines after SFC materialization, is what marks
     // this file as using `<script setup>`: Vue itself only allows them there.
     let mut cursor = root.walk();
+    let interface_bodies = collect_interface_bodies(root, src.as_bytes());
     for child in root.named_children(&mut cursor) {
-        let Some(call) = top_level_call(child) else {
+        let Some(mut call) = top_level_call(child) else {
             continue;
         };
+        // `withDefaults(defineProps<Props>(), { ... })` wraps the macro call.
+        let is_with_defaults = call
+            .child_by_field_name("function")
+            .is_some_and(|f| node_text(f, src.as_bytes()) == "withDefaults");
+        if is_with_defaults {
+            match call
+                .child_by_field_name("arguments")
+                .and_then(|a| a.named_child(0))
+                .filter(|c| c.kind() == "call_expression")
+            {
+                Some(inner) => call = inner,
+                None => continue,
+            }
+        }
         let Some(func) = call.child_by_field_name("function") else {
             continue;
         };
         if func.kind() != "identifier" {
+            continue;
+        }
+        // `defineModel()` / `defineModel('name', opts)`: an implicit prop plus its
+        // `update:<name>` event (`v-model` / `v-model:name` on the parent side).
+        if node_text(func, src.as_bytes()) == "defineModel" {
+            anchor.get_or_insert(child);
+            let name = call
+                .child_by_field_name("arguments")
+                .and_then(|a| a.named_child(0))
+                .filter(|a| a.kind() == "string")
+                .and_then(|a| a.named_child(0))
+                .map(|n| node_text(n, src.as_bytes()).to_string())
+                .unwrap_or_else(|| "modelValue".to_string());
+            model_names.push(name);
             continue;
         }
         let is_props = node_text(func, src.as_bytes()) == "defineProps";
@@ -2126,6 +2173,11 @@ fn detect_vue_component(
             continue;
         }
         anchor.get_or_insert(child);
+        if is_props {
+            saw_props_macro = true;
+        } else {
+            saw_emits_macro = true;
+        }
 
         // Runtime-argument form: `defineProps({...})`/`defineProps([...])`.
         let runtime_names = call
@@ -2136,8 +2188,7 @@ fn detect_vue_component(
         let type_names = call
             .child_by_field_name("type_arguments")
             .and_then(|ta| ta.named_child(0))
-            .filter(|t| t.kind() == "object_type")
-            .map(|t| object_member_names(t, src.as_bytes()));
+            .and_then(|t| macro_type_names(t, is_emits, &interface_bodies, src.as_bytes()));
         let Some(names) = runtime_names.or(type_names) else {
             continue;
         };
@@ -2152,6 +2203,24 @@ fn detect_vue_component(
     // still declares a component -- see `spectograph_js::parse`'s copy of
     // this fallback for why.
     let anchor = anchor.or(is_vue_script_setup.then_some(root))?;
+    // `defineModel` adds a prop and an event. Merge them into a list we already know; with no
+    // `defineProps`/`defineEmits` at all they *are* the whole list; but next to a macro whose
+    // contents we couldn't enumerate (empty = unknown) they'd make an incomplete list look
+    // authoritative, so leave that unknown.
+    if !model_names.is_empty() {
+        if declared_props.is_empty() && !saw_props_macro || !declared_props.is_empty() {
+            declared_props.extend(model_names.iter().cloned());
+        }
+        if declared_emits.is_empty() && !saw_emits_macro || !declared_emits.is_empty() {
+            declared_emits.extend(model_names.iter().map(|n| format!("update:{n}")));
+        }
+    }
+    if inherits_bindings {
+        // "Empty means unknown": a mixin/`extends` contributes props and emits we can't see,
+        // so don't report bindings as undeclared.
+        declared_props.clear();
+        declared_emits.clear();
+    }
     let name = explicit_name.unwrap_or_else(|| vue::component_name_from_path(path));
     let id = *next_id;
     *next_id += 1;
@@ -2164,7 +2233,123 @@ fn detect_vue_component(
         line: span(anchor).start_line,
         declared_props,
         declared_emits,
+        registered_components,
     })
+}
+
+/// Every string literal inside a type: `'a'`, `'a' | 'b'`.
+fn string_literals_in_type(node: Node, src: &[u8], out: &mut Vec<String>) {
+    if node.kind() == "string" {
+        out.push(strip_quotes(node_text(node, src)));
+        return;
+    }
+    let mut c = node.walk();
+    for child in node.named_children(&mut c) {
+        string_literals_in_type(child, src, out);
+    }
+}
+
+/// Event names from a call/function signature's parameter list, which is
+/// `defineEmits`' call-signature form: the first parameter is the event name
+/// (`(e: 'change', v: string): void`, or a union of names `(e: 'a' | 'b')`).
+fn event_names_from_signature(signature: Node, src: &[u8]) -> Vec<String> {
+    let mut out = Vec::new();
+    let Some(params) = signature.child_by_field_name("parameters") else {
+        return out;
+    };
+    let mut pc = params.walk();
+    let Some(first) = params
+        .named_children(&mut pc)
+        .find(|p| matches!(p.kind(), "required_parameter" | "optional_parameter"))
+    else {
+        return out;
+    };
+    if let Some(ty) = first.child_by_field_name("type") {
+        string_literals_in_type(ty, src, &mut out);
+    }
+    out
+}
+
+/// `defineEmits<{ change: [v: string]; (e: 'close'): void }>()` member names: property
+/// signatures (the 3.3+ form) plus call signatures (the older form), which can be mixed.
+fn emit_member_names(body: Node, src: &[u8]) -> Vec<String> {
+    let mut names = object_member_names(body, src);
+    let mut c = body.walk();
+    for member in body.named_children(&mut c) {
+        if member.kind() == "call_signature" {
+            names.extend(event_names_from_signature(member, src));
+        }
+    }
+    names
+}
+
+/// Top-level `interface X {...}` / `type X = {...}` bodies by name, so
+/// `defineProps<X>()`/`defineEmits<X>()` can resolve `X`. An interface that `extends`
+/// something is left out: its own members are only part of the real list, and a partial
+/// list would turn legitimate inherited props into false mismatches.
+fn collect_interface_bodies<'a>(root: Node<'a>, src: &[u8]) -> HashMap<String, Node<'a>> {
+    let mut out = HashMap::new();
+    let mut cursor = root.walk();
+    for child in root.named_children(&mut cursor) {
+        let decl = if child.kind() == "export_statement" {
+            child.child_by_field_name("declaration").unwrap_or(child)
+        } else {
+            child
+        };
+        match decl.kind() {
+            "interface_declaration" => {
+                let mut dc = decl.walk();
+                let extends = decl
+                    .named_children(&mut dc)
+                    .any(|n| n.kind() == "extends_type_clause");
+                if extends {
+                    continue;
+                }
+                if let (Some(name), Some(body)) = (
+                    decl.child_by_field_name("name"),
+                    decl.child_by_field_name("body"),
+                ) {
+                    out.insert(node_text(name, src).to_string(), body);
+                }
+            }
+            "type_alias_declaration" => {
+                if let (Some(name), Some(value)) = (
+                    decl.child_by_field_name("name"),
+                    decl.child_by_field_name("value"),
+                ) {
+                    if value.kind() == "object_type" {
+                        out.insert(node_text(name, src).to_string(), value);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// Names declared by a `defineProps<T>()`/`defineEmits<T>()` type argument: an inline
+/// object type, a reference to a same-file interface/alias, or (emits only) a function type
+/// `(e: 'a' | 'b') => void`. `None` when `T` isn't statically enumerable.
+fn macro_type_names(
+    ty: Node,
+    is_emits: bool,
+    interfaces: &HashMap<String, Node>,
+    src: &[u8],
+) -> Option<Vec<String>> {
+    let members = |body: Node| {
+        if is_emits {
+            emit_member_names(body, src)
+        } else {
+            object_member_names(body, src)
+        }
+    };
+    match ty.kind() {
+        "object_type" => Some(members(ty)),
+        "type_identifier" => interfaces.get(node_text(ty, src)).map(|b| members(*b)),
+        "function_type" if is_emits => Some(event_names_from_signature(ty, src)),
+        _ => None,
+    }
 }
 
 /// If `node` is a top-level statement wrapping a single bare call expression

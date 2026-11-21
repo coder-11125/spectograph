@@ -568,6 +568,7 @@ dependencies = [
 name = "spectograph-js"
 version = "0.1.0"
 dependencies = [
+ "globset",
  "ignore",
  "regex",
  "serde",

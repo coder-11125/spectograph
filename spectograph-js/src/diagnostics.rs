@@ -100,5 +100,10 @@ pub(crate) fn collect(
     let mut out = react_diagnostics(&components, &usages, root);
     let vue = crate::vue_mismatches(program, parsed, root)?;
     out.extend(vue_diagnostics(&vue, root));
+    // Unused scoped-style classes in the `.vue` files this analyzer owns (plain-JS scripts,
+    // or no script at all).
+    out.extend(crate::vue_css::unused_css_diagnostics(root, |lang| {
+        lang != Some(crate::vue::ScriptLang::TypeScript)
+    })?);
     Ok(finish(out))
 }

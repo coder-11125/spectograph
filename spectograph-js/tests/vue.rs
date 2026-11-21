@@ -384,7 +384,7 @@ fn undeclared_prop_and_event_are_flagged() {
         ),
         (
             "UserCard.vue",
-            "<script>\nexport default {\n  props: ['label'],\n  emits: ['change'],\n}\n</script>\n",
+            "<template><div/></template>\n<script>\nexport default {\n  props: ['label'],\n  emits: ['change'],\n}\n</script>\n",
         ),
     ]);
     assert!(mismatches

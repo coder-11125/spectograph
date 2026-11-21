@@ -19,40 +19,55 @@
 //! shape is identical between the two grammars (template scanning, the
 //! app-mount check below) -- those live here, shared.
 //!
+//! ## Coverage beyond components and templates
+//!
+//! Handled elsewhere, each with tests in `tests/vue_support.rs` of both analyzer crates:
+//!
+//! - **Routing:** route components (`component: Home`, lazy `() => import('./X.vue')`,
+//!   `children`, named `components: {...}`) need no special handling -- they are ordinary
+//!   imports and `import()` calls. File-based routing plugins (`vite-plugin-pages`,
+//!   `unplugin-vue-router`, `vite-plugin-vue-layouts`) make `src/pages/**` and
+//!   `src/layouts/**` entrypoints (`entrypoints.rs`); `import.meta.glob` and
+//!   `require.context` load every matched module (`globs.rs`).
+//! - **Vue 2:** `Vue.extend({...})`/`defineComponent({...})` default exports are components;
+//!   `new Vue({ el })` and `.$mount()` mark a bootstrap file; mixins and filters are ordinary
+//!   references; `.native`/`.sync` and other directive modifiers are understood.
+//! - **Stores (Pinia/Vuex):** a store is an ordinary module, so its reachability already
+//!   follows from imports and calls; nothing store-specific is modelled.
+//! - **`<component :is="expr">`:** the template word-matching in `template_bindings.rs` keeps
+//!   every identifier in any expression alive.
+//! - **Options API `components: { Tag: Ident }`** remaps are resolved for prop/emit checks.
+//! - **`defineProps<T>()` / `defineEmits<T>()`:** inline object types, call-signature and
+//!   function-type emits, same-file interfaces (without `extends`) and `withDefaults(...)`.
+//! - **Scoped CSS:** unused classes in `<style scoped>` are a diagnostic (`vue_css.rs`).
+//! - **`resolveComponent('name')`** / `resolveDynamicComponent('name')` in a script count as a
+//!   template tag for that name (`resolve_component_tags`).
+//! - **`defineModel()`** declares its prop and `update:<name>` event.
+//! - **Fallthrough attributes:** prop/emit mismatches are only reported against a component
+//!   whose template root is a plain element, and never for `aria-*`/`data-*`/`id`/... or native
+//!   DOM events; a component or `<slot>`/`<component>` root forwards them to something unseen.
+//!
 //! ## Known limitations
 //!
 //! Deliberately out of scope, rather than partially/unreliably supported:
 //!
-//! - **Vue 2** Options API quirks (`data`/`computed`/`methods` are read but
-//!   not specially interpreted beyond `name`/`props`/`emits`;
-//!   `Vue.extend()`/mixins/filters aren't recognized at all).
-//! - **Scoped `<style>` blocks**: not parsed or tracked at all -- no
-//!   unused-CSS-class detection.
-//! - **Vuex/Pinia stores**: a store's own reachability is ordinary
-//!   module/symbol analysis (imports and calls already work), but nothing
-//!   here understands `defineStore`/`mapState`/etc. specifically.
-//! - **Vue Router**: route-component associations
-//!   (`{ path: '/x', component: () => import('./X.vue') }`) aren't
-//!   recognized as component usage -- a route-only component looks
-//!   unreachable unless something else also references it. A route
-//!   config's `component:`/`components:` values a lazy-import matching
-//!   [`crate::parse`]'s `defineAsyncComponent` shape are the closest
-//!   partial coverage, and only by coincidence of shape, not because
-//!   routing is understood.
-//! - **`<component :is="expr">`** where `expr` isn't a bare identifier
-//!   (a ternary, a computed property access, ...) isn't resolved --
-//!   [`scan_template_component_candidates`] only handles the bare-identifier
-//!   form.
-//! - **`defineEmits<T>()`'s call-signature type form**
-//!   (`{ (e: 'change', v: string): void }`, as opposed to the property-
-//!   signature form `{ change: [v: string] }`) yields no declared emits,
-//!   not wrong ones -- see `object_member_names` in `spectograph_ts::parse`.
-//! - **Options API `components: { Tag: LocalIdent }` explicit remapping**
-//!   (as opposed to the `{ LocalIdent }` shorthand): the template-scope
-//!   maps built in each analyzer's `lib.rs` key local scope by each
-//!   *import's own local name*, not by an explicit remap key, so a
-//!   `components:` entry that renames its key relative to the import is
-//!   missed. The overwhelmingly common shorthand form is unaffected.
+//! - **Class-style components** (`vue-class-component`, `vue-property-decorator`:
+//!   `export default class X extends Vue`) are not detected as components, so their
+//!   props/emits aren't checked; reachability still works through the whole-module use of a
+//!   default import.
+//! - **Mixins/`extends`:** a component using them has *unknown* props and emits (they may come
+//!   from the mixin), so bindings passed to it are never reported as undeclared.
+//! - **`defineProps<T>()`/`defineEmits<T>()` where `T` is imported, intersected, or
+//!   `extends` another interface** yields no declared bindings (unknown), not partial ones.
+//! - **Render-function string lookups other than `resolveComponent`/`resolveDynamicComponent`**
+//!   (e.g. `h('name')` against a global registration) aren't matched to a component.
+//! - **Unused-CSS detection is conservative:** it skips any file with a non-enumerable class
+//!   binding (`:class="cls"`, ternaries, computed keys, `v-bind="obj"`), SCSS/Less class
+//!   concatenation (`&-x`) or interpolation, and `:deep`/`:global`/`:slotted` selectors, and
+//!   only inspects `<style scoped>` in CSS/SCSS/Less. A class used anywhere in the project's
+//!   templates, or named in the component's script, counts as used.
+//! - **Plugin folder options** (`routesFolder`, custom `dirs`) for the file-routing plugins are
+//!   not read; only the default `pages`/`layouts` folders are roots.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -88,6 +103,82 @@ pub struct VueComponent {
     /// or `<script setup>`'s `defineEmits(...)`/`defineEmits<T>()`. Same
     /// "empty means unknown, not none" convention as `declared_props`.
     pub declared_emits: Vec<String>,
+    /// Options API `components: { Tag: LocalIdent }` entries as `(tag, local identifier)`,
+    /// including the shorthand `{ LocalIdent }` (tag == identifier). The tag is the name a
+    /// template uses, which differs from the import's local name when the key is remapped.
+    pub registered_components: Vec<(String, String)>,
+}
+
+/// The Options API object behind a default export's value: the literal itself
+/// (`export default { ... }`), or the argument of the wrappers that exist only for typing and
+/// Vue 2 subclassing -- `defineComponent({ ... })`, `defineNuxtComponent({ ... })`,
+/// `Vue.extend({ ... })`. `None` for anything else (a class, an identifier, a call to
+/// something unrelated), which can't be enumerated.
+pub fn component_options_object<'a>(
+    value: tree_sitter::Node<'a>,
+    src: &[u8],
+) -> Option<tree_sitter::Node<'a>> {
+    match value.kind() {
+        "object" => Some(value),
+        "call_expression" => {
+            let func = value.child_by_field_name("function")?;
+            let name = match func.kind() {
+                "identifier" => func.utf8_text(src).ok()?,
+                "member_expression" => func.child_by_field_name("property")?.utf8_text(src).ok()?,
+                _ => return None,
+            };
+            if !matches!(name, "defineComponent" | "defineNuxtComponent" | "extend") {
+                return None;
+            }
+            value
+                .child_by_field_name("arguments")?
+                .named_child(0)
+                .filter(|a| a.kind() == "object")
+        }
+        _ => None,
+    }
+}
+
+/// `(tag, identifier)` pairs from an Options API `components: { ... }` object: `{ Card }`,
+/// `{ FancyCard: Card }`, `{ 'fancy-card': Card }`. Entries whose value isn't a bare
+/// identifier (an inline definition, a call) are skipped.
+pub fn extract_component_registrations(
+    node: tree_sitter::Node,
+    src: &[u8],
+) -> Vec<(String, String)> {
+    let text = |n: tree_sitter::Node| n.utf8_text(src).unwrap_or("").trim().to_string();
+    let mut out = Vec::new();
+    if node.kind() != "object" {
+        return out;
+    }
+    let mut c = node.walk();
+    for prop in node.named_children(&mut c) {
+        match prop.kind() {
+            "shorthand_property_identifier" => {
+                let name = text(prop);
+                out.push((name.clone(), name));
+            }
+            "pair" => {
+                let (Some(key), Some(value)) = (
+                    prop.child_by_field_name("key"),
+                    prop.child_by_field_name("value"),
+                ) else {
+                    continue;
+                };
+                if value.kind() != "identifier" {
+                    continue;
+                }
+                let tag = if key.kind() == "string" {
+                    key.named_child(0).map(text).unwrap_or_default()
+                } else {
+                    text(key)
+                };
+                out.push((tag, text(value)));
+            }
+            _ => {}
+        }
+    }
+    out
 }
 
 /// The component name Vue's own tooling (devtools, warnings) falls back to
@@ -418,7 +509,9 @@ pub fn has_vue_app_mount(root: tree_sitter::Node, src: &str) -> bool {
             ) else {
                 continue;
             };
-            if name_node.kind() == "identifier" && is_create_app_call(value, src) {
+            if name_node.kind() == "identifier"
+                && (is_create_app_call(value, src) || is_new_vue(value, src))
+            {
                 app_bindings.insert(node_text(name_node, src).to_string());
             }
         }
@@ -434,17 +527,53 @@ fn is_create_app_call(node: tree_sitter::Node, src: &str) -> bool {
             .unwrap_or(false)
 }
 
+/// `new Vue(...)`: the Vue 2 root-instance constructor.
+fn is_new_vue(node: tree_sitter::Node, src: &str) -> bool {
+    node.kind() == "new_expression"
+        && node
+            .child_by_field_name("constructor")
+            .map(|c| c.kind() == "identifier" && node_text(c, src) == "Vue")
+            .unwrap_or(false)
+}
+
+/// `new Vue({ el: '#app', ... })`: Vue 2 mounts itself through the `el` option, no `.mount()`
+/// call needed.
+fn is_new_vue_with_el(node: tree_sitter::Node, src: &str) -> bool {
+    if !is_new_vue(node, src) {
+        return false;
+    }
+    let Some(options) = node
+        .child_by_field_name("arguments")
+        .and_then(|a| a.named_child(0))
+        .filter(|o| o.kind() == "object")
+    else {
+        return false;
+    };
+    let mut c = options.walk();
+    let found = options.named_children(&mut c).any(|p| {
+        p.kind() == "pair"
+            && p.child_by_field_name("key")
+                .map(|k| node_text(k, src) == "el")
+                .unwrap_or(false)
+    });
+    found
+}
+
 fn find_mount_call(node: tree_sitter::Node, src: &str, app_bindings: &HashSet<String>) -> bool {
+    if is_new_vue_with_el(node, src) {
+        return true;
+    }
     if node.kind() == "call_expression" {
         if let Some(func) = node.child_by_field_name("function") {
             if func.kind() == "member_expression"
                 && func
                     .child_by_field_name("property")
-                    .map(|p| node_text(p, src) == "mount")
+                    .map(|p| matches!(node_text(p, src), "mount" | "$mount"))
                     .unwrap_or(false)
             {
                 if let Some(object) = func.child_by_field_name("object") {
                     let is_app = is_create_app_call(object, src)
+                        || is_new_vue(object, src)
                         || (object.kind() == "identifier"
                             && app_bindings.contains(node_text(object, src)));
                     if is_app {
@@ -648,20 +777,24 @@ fn open_tag_re() -> &'static Regex {
 fn bind_attr_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     // `:label="x"` / `v-bind:label="x"` -- a bound (dynamic-value) prop.
-    RE.get_or_init(|| Regex::new(r"(?:^|\s)(?::|v-bind:)([\w-]+)=").unwrap())
+    // Modifiers (`:title.sync`, `:foo.camel`, `:foo.prop`) follow the name.
+    RE.get_or_init(|| Regex::new(r"(?:^|\s)(?::|v-bind:)([\w-]+)(?:\.[\w-]+)*=").unwrap())
 }
 
 fn on_attr_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
-    // `@click="fn"` / `v-on:click="fn"` -- an event listener.
-    RE.get_or_init(|| Regex::new(r"(?:^|\s)(?:@|v-on:)([\w-]+)=").unwrap())
+    // `@click="fn"` / `v-on:click="fn"` -- an event listener. The name may carry a `:`
+    // (`@update:modelValue`) and modifiers (`@close.once`, `@click.native`, captured in
+    // group 2 so `.native` -- a DOM listener, not a component event -- can be dropped).
+    RE.get_or_init(|| Regex::new(r"(?:^|\s)(?:@|v-on:)([\w:-]+)((?:\.[\w-]+)*)=").unwrap())
 }
 
 fn vmodel_attr_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     // `v-model="x"` (implies prop `modelValue` + event `update:modelValue`)
-    // or `v-model:label="x"` (implies prop `label` + event `update:label`).
-    RE.get_or_init(|| Regex::new(r"(?:^|\s)v-model(?::([\w-]+))?=").unwrap())
+    // or `v-model:label="x"` (implies prop `label` + event `update:label`); modifiers
+    // (`v-model.trim`, `v-model:label.number`) are ignored.
+    RE.get_or_init(|| Regex::new(r"(?:^|\s)v-model(?::([\w-]+))?(?:\.[\w-]+)*=").unwrap())
 }
 
 fn static_attr_re() -> &'static Regex {
@@ -693,6 +826,9 @@ pub fn scan_template_component_usages(template: &str) -> Vec<TemplateComponentUs
                 .collect();
             let mut events: Vec<String> = on_attr_re()
                 .captures_iter(attrs_blob)
+                // `@click.native` listens on the component's root DOM element, not for an
+                // emitted event.
+                .filter(|c| !c[2].split('.').any(|m| m == "native"))
                 .map(|c| kebab_to_camel(&c[1]))
                 .collect();
             for c in vmodel_attr_re().captures_iter(attrs_blob) {
@@ -750,6 +886,101 @@ pub struct VueBindingMismatch {
     pub line: usize,
 }
 
+fn resolve_component_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(r#"\bresolve(?:Dynamic)?Component\(\s*['"]([A-Za-z][\w:-]*)['"]"#).unwrap()
+    })
+}
+
+/// A synthetic template fragment with one `<Name/>` per `resolveComponent('name')` call in the
+/// SFC's script blocks. Vue resolves those strings against the same registrations a template
+/// tag would, so appending these to the template lets the existing tag matching connect them.
+pub fn resolve_component_tags(sfc: &SfcFile) -> String {
+    let mut out = String::new();
+    for block in [&sfc.script, &sfc.script_setup].into_iter().flatten() {
+        for caps in resolve_component_re().captures_iter(&block.content) {
+            out.push_str(&format!("<{}/>\n", &caps[1]));
+        }
+    }
+    out
+}
+
+/// The tag name of a template's first element (its root, or the first of several).
+fn root_tag(template: &str) -> Option<String> {
+    open_tag_re().captures(template).map(|c| c[1].to_string())
+}
+
+/// True for an ordinary HTML/SVG element name (`div`, `button`, `svg`): lowercase letters and
+/// digits only. Components (PascalCase or kebab-case), `<component>`, `<slot>`,
+/// `<template>`, `<transition>` and the other built-ins are not.
+fn is_plain_element(tag: &str) -> bool {
+    tag.chars()
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+        && !matches!(
+            tag,
+            "component"
+                | "slot"
+                | "template"
+                | "transition"
+                | "transitiongroup"
+                | "teleport"
+                | "suspense"
+                | "keepalive"
+        )
+}
+
+/// Props every element accepts as a plain attribute, so passing one to a component whose root
+/// is an element is fallthrough, not a mistake.
+fn is_global_attribute(prop: &str) -> bool {
+    let camel_prefixed = |prefix: &str| {
+        prop.strip_prefix(prefix)
+            .and_then(|rest| rest.chars().next())
+            .is_some_and(|c| c.is_ascii_uppercase())
+    };
+    matches!(
+        prop,
+        "id" | "title" | "role" | "tabindex" | "lang" | "dir" | "hidden"
+    ) || camel_prefixed("aria")
+        || camel_prefixed("data")
+}
+
+/// DOM events a component's root element receives as a fallthrough listener.
+const NATIVE_EVENTS: &[&str] = &[
+    "click",
+    "dblclick",
+    "contextmenu",
+    "mousedown",
+    "mouseup",
+    "mousemove",
+    "mouseenter",
+    "mouseleave",
+    "mouseover",
+    "mouseout",
+    "keydown",
+    "keyup",
+    "keypress",
+    "focus",
+    "blur",
+    "focusin",
+    "focusout",
+    "input",
+    "submit",
+    "scroll",
+    "wheel",
+    "touchstart",
+    "touchmove",
+    "touchend",
+    "pointerdown",
+    "pointerup",
+    "pointermove",
+    "dragstart",
+    "dragover",
+    "drop",
+    "load",
+    "error",
+];
+
 /// Flag template usage sites that pass a prop/emit the target component
 /// doesn't declare. Only checks targets whose props/emits were statically
 /// enumerable (a non-empty `declared_props`/`declared_emits`); a target
@@ -765,6 +996,10 @@ pub fn find_binding_mismatches(
 ) -> Vec<VueBindingMismatch> {
     let by_symbol: HashMap<SymbolId, &VueComponent> =
         components.iter().map(|c| (c.symbol_id, c)).collect();
+    let template_by_component: HashMap<SymbolId, &str> = sites
+        .iter()
+        .map(|s| (s.using_symbol, s.template.as_str()))
+        .collect();
 
     let mut out = Vec::new();
     for site in sites {
@@ -782,13 +1017,30 @@ pub fn find_binding_mismatches(
             let Some(target) = target else {
                 continue;
             };
+            // Undeclared attributes and listeners fall through to the target's root. When that
+            // root is another component (or unknowable) we can't tell what it accepts, so
+            // there is nothing to check; when it is a plain element, DOM-global attributes
+            // and native events are legitimate even though undeclared.
+            let root_is_plain_element = match template_by_component.get(&target.symbol_id) {
+                Some(t) => root_tag(t).is_some_and(|tag| is_plain_element(&tag)),
+                None => false,
+            };
+            if !root_is_plain_element {
+                continue;
+            }
 
             if !target.declared_props.is_empty() {
                 for prop in &usage.props {
-                    if IMPLICIT_PROPS.contains(&prop.as_str()) {
+                    if IMPLICIT_PROPS.contains(&prop.as_str()) || is_global_attribute(prop) {
                         continue;
                     }
-                    if !target.declared_props.iter().any(|p| p == prop) {
+                    // `defineProps({ 'user-id': ... })` is bound as `:user-id` or `:userId`
+                    // alike, and usage names are already camelCased.
+                    if !target
+                        .declared_props
+                        .iter()
+                        .any(|p| p == prop || kebab_to_camel(p) == *prop)
+                    {
                         out.push(VueBindingMismatch {
                             target_component: target.name.clone(),
                             binding: prop.clone(),
@@ -801,7 +1053,16 @@ pub fn find_binding_mismatches(
             }
             if !target.declared_emits.is_empty() {
                 for event in &usage.events {
-                    if !target.declared_emits.iter().any(|e| e == event) {
+                    if NATIVE_EVENTS.contains(&event.as_str()) {
+                        continue;
+                    }
+                    // `emits: ['change-value']` is listened for as `@change-value` or
+                    // `@changeValue` alike, and usage names are already camelCased.
+                    if !target
+                        .declared_emits
+                        .iter()
+                        .any(|e| e == event || kebab_to_camel(e) == *event)
+                    {
                         out.push(VueBindingMismatch {
                             target_component: target.name.clone(),
                             binding: event.clone(),
@@ -1123,6 +1384,7 @@ mod tests {
             line: 1,
             declared_props: props.iter().map(|s| s.to_string()).collect(),
             declared_emits: emits.iter().map(|s| s.to_string()).collect(),
+            registered_components: Vec::new(),
         }
     }
 
@@ -1130,11 +1392,16 @@ mod tests {
     fn find_binding_mismatches_flags_undeclared_prop_and_event() {
         let using = test_component(0, "App", &[], &[]);
         let target = test_component(1, "UserCard", &["label"], &["change"]);
-        let sites = vec![site(
-            "App.vue",
-            r#"<user-card label="hi" :extra="1" @change="f()" @bogus="g()"/>"#,
-            0,
-        )];
+        let sites = vec![
+            site(
+                "App.vue",
+                r#"<user-card label="hi" :extra="1" @change="f()" @bogus="g()"/>"#,
+                0,
+            ),
+            // The target's own template: a plain `<div>` root, so attributes fall through
+            // to an element and undeclared ones are checkable.
+            site("UserCard.vue", "<div/>", 1),
+        ];
         let mut local_scope = HashMap::new();
         local_scope.insert((PathBuf::from("App.vue"), "UserCard".to_string()), 1);
 

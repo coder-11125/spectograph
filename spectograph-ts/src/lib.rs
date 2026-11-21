@@ -83,6 +83,15 @@ fn build_globset(patterns: &[String], root: &Path) -> Option<globset::GlobSet> {
     }
     let mut builder = globset::GlobSetBuilder::new();
     for pattern in patterns {
+        // Files are matched by root-relative path (`src/a.ts`), so a leading `./` would never
+        // match, and `"."`/`"./"` -- "this whole directory", common in nested tsconfigs --
+        // means everything.
+        let pattern = pattern.trim_start_matches("./");
+        let pattern = if pattern.is_empty() || pattern == "." {
+            "**"
+        } else {
+            pattern
+        };
         if let Some(glob) = tsconfig_glob(pattern) {
             builder.add(glob);
         }
@@ -120,14 +129,43 @@ fn filter_by_tsconfig(files: Vec<PathBuf>, root: &Path, tsconfig: &TsConfig) -> 
         .exclude
         .as_deref()
         .and_then(|p| build_globset(p, root));
+    // Nested projects (`packages/x/tsconfig.json`) have their own include/exclude, relative to
+    // their own directory: a file the root config leaves out can still belong to the program
+    // of the nearest nested config above it. Cached per directory.
+    type Sets = (Option<globset::GlobSet>, Option<globset::GlobSet>);
+    let mut nested: HashMap<PathBuf, Sets> = HashMap::new();
+    let mut nested_keeps = |file: &Path| -> bool {
+        for dir in file.ancestors().skip(1) {
+            let Ok(rel_dir) = dir.strip_prefix(root) else {
+                return false;
+            };
+            if rel_dir.as_os_str().is_empty() {
+                return false; // reached the root, which already said no
+            }
+            if !dir.join("tsconfig.json").is_file() {
+                continue;
+            }
+            let (inc, exc) = nested.entry(dir.to_path_buf()).or_insert_with(|| {
+                let cfg = spectograph_js::tsconfig::read_tsconfig(dir);
+                (
+                    cfg.include.as_deref().and_then(|p| build_globset(p, dir)),
+                    cfg.exclude.as_deref().and_then(|p| build_globset(p, dir)),
+                )
+            });
+            let rel = file.strip_prefix(dir).unwrap_or(file);
+            return !exc.as_ref().is_some_and(|s| s.is_match(rel))
+                && inc.as_ref().is_none_or(|s| s.is_match(rel));
+        }
+        false
+    };
+
     files
         .into_iter()
         .filter(|f| {
             let rel = f.strip_prefix(root).unwrap_or(f);
-            if exclude_set.as_ref().is_some_and(|s| s.is_match(rel)) {
-                return false;
-            }
-            include_set.as_ref().is_none_or(|s| s.is_match(rel))
+            let kept_by_root = !exclude_set.as_ref().is_some_and(|s| s.is_match(rel))
+                && include_set.as_ref().is_none_or(|s| s.is_match(rel));
+            kept_by_root || nested_keeps(f)
         })
         .collect()
 }
@@ -381,6 +419,19 @@ fn build_vue_scope_maps(
                 if vue_component_ids.contains(&target) {
                     local_scope.insert((path.clone(), reg.local_name.clone()), target);
                 }
+            }
+        }
+    }
+
+    // Options API `components: { Tag: LocalIdent }`: a template uses the key, which differs
+    // from the import's own name when remapped.
+    for (path, result) in parsed {
+        let Some(component) = &result.vue_component else {
+            continue;
+        };
+        for (tag, ident) in &component.registered_components {
+            if let Some(&target) = local_scope.get(&(path.clone(), ident.clone())) {
+                local_scope.insert((path.clone(), vue::kebab_to_pascal(tag)), target);
             }
         }
     }
@@ -703,8 +754,18 @@ impl TypeScriptAnalyzer {
             let sfc = vue::parse_sfc(&src);
             if let Some((materialized, vue::ScriptLang::TypeScript)) = vue::materialize_script(&sfc)
             {
-                if let Some(template) = &sfc.template {
-                    vue_templates.push((path.clone(), template.content.clone()));
+                // The template, plus a synthetic `<Name/>` per `resolveComponent('name')` in
+                // the script (render functions and `<script setup>` look components up by
+                // string), so both resolve through the same name maps.
+                let lookups = vue::resolve_component_tags(&sfc);
+                let content = match (&sfc.template, lookups.is_empty()) {
+                    (Some(t), true) => Some(t.content.clone()),
+                    (Some(t), false) => Some(format!("{}\n{lookups}", t.content)),
+                    (None, false) => Some(lookups),
+                    (None, true) => None,
+                };
+                if let Some(content) = content {
+                    vue_templates.push((path.clone(), content));
                 }
                 if sfc.script_setup.is_some() {
                     vue_script_setup_files.insert(path.clone());
@@ -827,6 +888,12 @@ impl TypeScriptAnalyzer {
             }
         }
 
+        // module symbol -> the Vue component a `.vue` file defines (its default export).
+        let vue_component_by_module: HashMap<SymbolId, SymbolId> = parsed
+            .iter()
+            .filter_map(|(_p, r)| r.vue_component.as_ref().map(|c| (r.module_id, c.symbol_id)))
+            .collect();
+
         // Pass: resolve imports (including the "from" half of re-exports) to
         // their definitions in the source module.
         for (path, result) in &parsed {
@@ -848,6 +915,17 @@ impl TypeScriptAnalyzer {
                 // *declaration*, never an import binding of the target module that merely
                 // happens to share the name.
                 let mut linked = false;
+                // A default import of a `.vue` file binds that file's component, whatever
+                // the importing binding is called and whether the component is an
+                // anonymous `export default {...}` (which otherwise only matches the
+                // generic `default` export symbol) or a `<script setup>`. Linked first so
+                // it stays the import's first edge, which the Vue scope maps read.
+                if imp.is_default {
+                    if let Some(&component) = vue_component_by_module.get(&target_module_id) {
+                        edges.push(imp.symbol_id, component, RefKind::ReExport);
+                        linked = true;
+                    }
+                }
                 if imp.imported_name == "*" {
                     // Namespace import / `export * from` / `export * as ns from`: every
                     // export of the module is in play.
@@ -876,6 +954,24 @@ impl TypeScriptAnalyzer {
                 // Importing a module runs it, so it is reachable whenever the import is
                 // (pushed after the definition edge so that stays the import's first edge).
                 edges.push(imp.symbol_id, target_module_id, RefKind::ReExport);
+            }
+        }
+
+        // Pass: bundler glob imports (`import.meta.glob`, `require.context`). Every matched
+        // module is loaded and used as a whole by the file that wrote the glob.
+        for (path, result) in &parsed {
+            if result.module_globs.is_empty() {
+                continue;
+            }
+            let base = path.parent().unwrap_or(path);
+            for target in spectograph_js::globs::resolve_module_globs(
+                &result.module_globs,
+                base,
+                root,
+                &module_paths,
+            ) {
+                edges.push(result.module_id, target, RefKind::Static);
+                whole_module_uses.push((result.module_id, target));
             }
         }
 

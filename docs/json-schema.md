@@ -28,8 +28,10 @@ The JSON report is a stable contract for CI and for the future `fix` loop. Pinne
 
 ## Diagnostic
 
-`code` (`REACT_PROP_MISMATCH`, `ANGULAR_BINDING_MISMATCH`, `VUE_PROP_MISMATCH`,
-`VUE_EVENT_MISMATCH`), `message`, `file`, `line`.
+`code`, `message`, `file`, `line`. `code` is one of `react-prop-mismatch`,
+`angular-binding-mismatch`, `vue-prop-mismatch`, `vue-event-mismatch`,
+`vue-unused-css-class` (a `<style scoped>` class selector no template or script uses;
+additive, so `schema_version` stays `1`).
 
 ## Exit codes
 

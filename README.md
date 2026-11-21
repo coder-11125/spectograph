@@ -30,7 +30,11 @@ Implemented:
   access, implicit uses (constructors, lifecycle hooks, externally-extended classes).
 - **Frameworks** (additive on the same parse pass): React (components, JSX, hooks, prop
   mismatches), Angular (decorators, templates, DI, binding mismatches), Vue (SFCs, template
-  usage and script bindings, prop/emit mismatches). Mismatches appear as `diagnostics`.
+  usage and script bindings, prop/emit mismatches, route components, file-based routing
+  plugins, `import.meta.glob`/`require.context`, Vue 2 patterns, `defineComponent`,
+  `defineEmits<T>()` type forms, `defineModel()`, `resolveComponent('x')`, and unused
+  `<style scoped>` classes). Mismatches and unused
+  CSS appear as `diagnostics`; Vue limits are listed in `spectograph-js/src/vue.rs`'s module doc.
 - **Python:** scope/import aliasing, class/method resolution, inheritance, `__init__.py`
   and `__all__`, optional basedpyright resolution.
 - Optional type-aware resolution via `typescript-language-server`.

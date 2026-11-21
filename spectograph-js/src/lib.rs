@@ -6,6 +6,7 @@ pub mod aliases;
 pub mod diagnostics;
 pub mod entrypoints;
 pub mod exports;
+pub mod globs;
 pub mod implicit;
 pub mod jsonc;
 pub mod parse;
@@ -15,6 +16,7 @@ pub mod shift;
 pub mod template_bindings;
 pub mod tsconfig;
 pub mod vue;
+pub mod vue_css;
 
 /// The `typescript-language-server`-backed type-aware resolution backend
 /// lives in `spectograph-tsserver` since `spectograph-ts` also shares it (and
@@ -472,6 +474,20 @@ fn build_vue_scope_maps(program: &Program, parsed: &[(String, parse::FileResult)
         }
     }
 
+    // Options API `components: { Tag: LocalIdent }`: a template uses the key, which differs
+    // from the import's own name when remapped.
+    for (path, result) in parsed {
+        let Some(component) = &result.vue_component else {
+            continue;
+        };
+        for (tag, ident) in &component.registered_components {
+            let file = PathBuf::from(path.as_str());
+            if let Some(&target) = local_scope.get(&(file.clone(), ident.clone())) {
+                local_scope.insert((file, vue::kebab_to_pascal(tag)), target);
+            }
+        }
+    }
+
     // `app.component('Name', Foo)` registrations, resolved through the
     // same per-file local scope (the call site's own file is where `Foo`
     // needs to resolve from) into a project-wide tag-name map.
@@ -740,8 +756,18 @@ impl JavaScriptAnalyzer {
             let sfc = vue::parse_sfc(&src);
             if let Some((materialized, vue::ScriptLang::JavaScript)) = vue::materialize_script(&sfc)
             {
-                if let Some(template) = &sfc.template {
-                    vue_templates.push((path.clone(), template.content.clone()));
+                // The template, plus a synthetic `<Name/>` per `resolveComponent('name')` in
+                // the script (render functions and `<script setup>` look components up by
+                // string), so both resolve through the same name maps.
+                let lookups = vue::resolve_component_tags(&sfc);
+                let content = match (&sfc.template, lookups.is_empty()) {
+                    (Some(t), true) => Some(t.content.clone()),
+                    (Some(t), false) => Some(format!("{}\n{lookups}", t.content)),
+                    (None, false) => Some(lookups),
+                    (None, true) => None,
+                };
+                if let Some(content) = content {
+                    vue_templates.push((path.clone(), content));
                 }
                 if sfc.script_setup.is_some() {
                     vue_script_setup_files.insert(path.clone());
@@ -887,6 +913,12 @@ impl JavaScriptAnalyzer {
             }
         }
 
+        // module symbol -> the Vue component a `.vue` file defines (its default export).
+        let vue_component_by_module: HashMap<SymbolId, SymbolId> = parsed
+            .iter()
+            .filter_map(|(_p, r)| r.vue_component.as_ref().map(|c| (r.module_id, c.symbol_id)))
+            .collect();
+
         // Pass 3: resolve import references to their definitions.
         // For ES6: import {x} from "y" -> link Import symbol to definition in module y
         // For CommonJS: const x = require("y") -> link Import symbol to definition in module y
@@ -923,6 +955,20 @@ impl JavaScriptAnalyzer {
                 // of naming, not what the import refers to. And a *guessed* default must be
                 // a declaration: the module may import something of the same name itself.)
                 let mut linked = false;
+                // A default import of a `.vue` file binds that file's component, whatever
+                // the importing binding is called. Linked first so it stays the import's
+                // first edge, which the Vue scope maps read.
+                if imp.is_default {
+                    if let Some(&component) = vue_component_by_module.get(&target_module_id) {
+                        edges.push(Reference {
+                            from: imp.symbol_id,
+                            to: component,
+                            kind: RefKind::ReExport,
+                            environment: ref_env,
+                        });
+                        linked = true;
+                    }
+                }
                 if imp.imported_name == "*" {
                     // Namespace import / `export * from`: every export of the module.
                     whole_module_uses.push((imp.symbol_id, target_module_id));
@@ -962,6 +1008,26 @@ impl JavaScriptAnalyzer {
                     kind: RefKind::ReExport,
                     environment: ref_env,
                 });
+            }
+        }
+
+        // Pass 3.5: bundler glob imports (`import.meta.glob`, `require.context`). Every
+        // matched module is loaded and used as a whole by the file that wrote the glob.
+        for (path, result) in &parsed {
+            if result.module_globs.is_empty() {
+                continue;
+            }
+            let base = Path::new(path.as_str()).parent().unwrap_or(Path::new(""));
+            for target in
+                globs::resolve_module_globs(&result.module_globs, base, root, &module_paths)
+            {
+                edges.push(Reference {
+                    from: result.module_id,
+                    to: target,
+                    kind: RefKind::Static,
+                    environment: Environment::Universal,
+                });
+                whole_module_uses.push((result.module_id, target));
             }
         }
 

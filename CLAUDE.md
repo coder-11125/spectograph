@@ -76,7 +76,10 @@ Conventions used everywhere in resolution code:
   api_roots, fallback}`; frameworks' conventions; in fallback every module is an entrypoint
   and `api_roots` is empty), `exports.rs` (API-root rule + whole-module-use rule),
   `implicit.rs` (constructors, protocol methods, lifecycle hooks, external bases, JSX
-  `React`, `.d.ts`), `template_bindings.rs`, `diagnostics.rs`. Type-aware resolution lives in
+  `React`, `.d.ts`), `template_bindings.rs`, `diagnostics.rs`, `globs.rs` (`import.meta.glob` /
+  `require.context` bulk imports; `FileResult.module_globs`), `vue_css.rs` (unused
+  `<style scoped>` class diagnostic, deliberately conservative -- it skips anything it can't
+  enumerate). Type-aware resolution lives in
   `spectograph-tsserver`.
 - **Parallel parsing (JS/TS).** Pass 1 parses files via `spectograph_analyzer::parallel::par_map`
   (rayon, 32 MiB worker stacks since tree walks are recursive, sequential below 16 files) with
@@ -97,7 +100,14 @@ once (`react.rs`, `vue.rs` in `spectograph-js`; `angular.rs` in `spectograph-ts`
 grammar-specific tree walking is duplicated per crate's `parse.rs`. Vue: `parse_sfc` does
 depth-aware nested `<template>` matching; `materialize_script` pins each script line to its
 true position. Known gaps are in `vue.rs`'s module doc. Match the existing split when
-extending.
+extending. Vue facts worth knowing: a default import of a `.vue` file links straight to that
+file's component symbol (first edge, which the scope maps read); a component using
+`mixins`/`extends` has deliberately *empty* (unknown) declared props/emits; file-routing
+plugins are detected from `package.json` deps (`Frameworks::vue_file_routing`). Vue tests live
+in `tests/vue_support.rs` (both crates) plus the older `tests/vue.rs`. Mismatch checks skip a
+target whose template root isn't a plain element (fallthrough attrs), so a unit/integration
+fixture for the *target* component must include a `<template>` with an element root. A tsconfig
+`include`/`exclude` is honored per nearest `tsconfig.json` (`filter_by_tsconfig` in `ts/lib.rs`).
 
 ### Testing convention
 

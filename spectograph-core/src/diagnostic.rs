@@ -22,3 +22,4 @@ pub const REACT_PROP_MISMATCH: &str = "react-prop-mismatch";
 pub const ANGULAR_BINDING_MISMATCH: &str = "angular-binding-mismatch";
 pub const VUE_PROP_MISMATCH: &str = "vue-prop-mismatch";
 pub const VUE_EVENT_MISMATCH: &str = "vue-event-mismatch";
+pub const VUE_UNUSED_CSS_CLASS: &str = "vue-unused-css-class";

@@ -13,6 +13,11 @@ loop that refactors a codebase lean — verified by the project's own smoke test
 - [x] Python, JavaScript, TypeScript analyzers (tree-sitter)
 - [x] JS/TS: entrypoint + public-API detection, tsconfig/package.json/workspace resolution
 - [x] JS/TS: React, Angular, Vue support; framework diagnostics surfaced in `check`
+- [x] Vue completeness: route components, file-based routing plugins, `import.meta.glob` /
+      `require.context`, Vue 2 (`Vue.extend`, `new Vue({ el })`, mixins), `defineComponent`,
+      `defineEmits<T>()` type forms, directive modifiers, unused `<style scoped>` classes
+      `defineModel`, `resolveComponent`, fallthrough-aware mismatch checks; validated on
+      vue3-realworld and vuejs/core (remaining limits: `vue.rs` module doc)
 - [x] Accuracy benchmark on real repos (`scripts/bench.py`, `docs/accuracy.md`)
 - [x] CI + release workflows (written; **not yet verified on GitHub / Windows**)
 - [ ] `fix` agent loop, worktree isolation, smoke/CI gate (currently exits 2)
@@ -78,7 +83,7 @@ spectograph/
 
 Shared JS/TS modules in `spectograph-js`: `aliases` (project resolver), `tsconfig` +
 `jsonc`, `pathutil`, `entrypoints`, `exports`, `implicit`, `template_bindings`,
-`diagnostics`, `react`, `vue`. Framework support is additive on the same parse pass, not a
+`diagnostics`, `react`, `vue`, `globs`, `vue_css`. Framework support is additive on the same parse pass, not a
 crate per framework.
 
 Not yet started: `spectograph-go`, `-rs`, `-java`, `-kotlin`, `-c`, `-cpp`, `-ruby`.

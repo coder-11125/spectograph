@@ -145,6 +145,8 @@ pub struct FileResult {
     /// bootstrap convention, used to mark it as an entrypoint independent
     /// of its filename/`package.json` (see [`vue::has_vue_app_mount`]).
     pub vue_app_mount: bool,
+    /// `import.meta.glob(...)` / `require.context(...)` bulk imports (see [`crate::globs`]).
+    pub module_globs: Vec<crate::globs::ModuleGlob>,
 }
 
 pub struct ImportDecl {
@@ -327,6 +329,7 @@ pub fn parse_file(
         vue_global_registrations,
         vue_async_components,
         vue_app_mount,
+        module_globs: crate::globs::collect_module_globs(root, src),
     }
 }
 
@@ -712,6 +715,11 @@ fn detect_vue_component(
 
     let mut declared_props = Vec::new();
     let mut declared_emits = Vec::new();
+    let mut registered_components: Vec<(String, String)> = Vec::new();
+    let mut inherits_bindings = false;
+    let mut model_names: Vec<String> = Vec::new();
+    let mut saw_props_macro = false;
+    let mut saw_emits_macro = false;
     let mut explicit_name: Option<String> = None;
     let mut anchor: Option<Node> = None;
 
@@ -721,12 +729,12 @@ fn detect_vue_component(
         if child.kind() != "export_statement" {
             continue;
         }
-        let Some(value) = child.child_by_field_name("value") else {
+        let Some(value) = child
+            .child_by_field_name("value")
+            .and_then(|v| vue::component_options_object(v, src.as_bytes()))
+        else {
             continue;
         };
-        if value.kind() != "object" {
-            continue;
-        }
         anchor = Some(child);
         let mut oc = value.walk();
         for prop in value.named_children(&mut oc) {
@@ -753,6 +761,15 @@ fn detect_vue_component(
                     declared_emits =
                         vue::extract_names_from_array_or_object(prop_value, src.as_bytes());
                 }
+                "components" => {
+                    registered_components.extend(vue::extract_component_registrations(
+                        prop_value,
+                        src.as_bytes(),
+                    ));
+                }
+                // Props/emits merged in from elsewhere: the component's own lists are only
+                // part of what it accepts.
+                "mixins" | "extends" => inherits_bindings = true,
                 _ => {}
             }
         }
@@ -774,12 +791,31 @@ fn detect_vue_component(
         if func.kind() != "identifier" {
             continue;
         }
+        // `defineModel()` / `defineModel('name', opts)`: an implicit prop plus its
+        // `update:<name>` event (`v-model` / `v-model:name` on the parent side).
+        if node_text(func, src.as_bytes()) == "defineModel" {
+            anchor.get_or_insert(child);
+            let name = call
+                .child_by_field_name("arguments")
+                .and_then(|a| a.named_child(0))
+                .filter(|a| a.kind() == "string")
+                .and_then(|a| a.named_child(0))
+                .map(|n| node_text(n, src.as_bytes()).to_string())
+                .unwrap_or_else(|| "modelValue".to_string());
+            model_names.push(name);
+            continue;
+        }
         let is_props = node_text(func, src.as_bytes()) == "defineProps";
         let is_emits = node_text(func, src.as_bytes()) == "defineEmits";
         if !is_props && !is_emits {
             continue;
         }
         anchor.get_or_insert(child);
+        if is_props {
+            saw_props_macro = true;
+        } else {
+            saw_emits_macro = true;
+        }
         let Some(names) = call
             .child_by_field_name("arguments")
             .and_then(|a| a.named_child(0))
@@ -799,6 +835,24 @@ fn detect_vue_component(
     // particular statement inside the block to treat it as one, so this
     // falls back to the whole file as the anchor.
     let anchor = anchor.or(is_vue_script_setup.then_some(root))?;
+    // `defineModel` adds a prop and an event. Merge them into a list we already know; with no
+    // `defineProps`/`defineEmits` at all they *are* the whole list; but next to a macro whose
+    // contents we couldn't enumerate (empty = unknown) they'd make an incomplete list look
+    // authoritative, so leave that unknown.
+    if !model_names.is_empty() {
+        if declared_props.is_empty() && !saw_props_macro || !declared_props.is_empty() {
+            declared_props.extend(model_names.iter().cloned());
+        }
+        if declared_emits.is_empty() && !saw_emits_macro || !declared_emits.is_empty() {
+            declared_emits.extend(model_names.iter().map(|n| format!("update:{n}")));
+        }
+    }
+    if inherits_bindings {
+        // "Empty means unknown": a mixin/`extends` contributes props and emits we can't see,
+        // so don't report bindings as undeclared.
+        declared_props.clear();
+        declared_emits.clear();
+    }
     let name = explicit_name.unwrap_or_else(|| vue::component_name_from_path(path));
     let id = *next_id;
     *next_id += 1;
@@ -818,6 +872,7 @@ fn detect_vue_component(
         line: span(anchor).start_line,
         declared_props,
         declared_emits,
+        registered_components,
     })
 }
 
