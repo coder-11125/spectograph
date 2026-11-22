@@ -419,3 +419,86 @@ function neverUsedAnywhere() {}
     ]);
     assert_eq!(found, vec!["neverUsedAnywhere"]);
 }
+
+// --- found auditing the remaining reds on vuejs/core ----------------------------------
+
+#[test]
+fn destructuring_defaults_in_declarations_use_what_they_name() {
+    // `const [x, y = EMPTY] = xs` / `const { z = C } = o` / `{ [KEY]: v }` all read the
+    // right-hand names; only the bound names are declarations.
+    no_dead(&[
+        ("package.json", r#"{"main": "src/index.ts"}"#),
+        (
+            "src/a.ts",
+            "export const EMPTY = {};\nexport const C = 1;\nexport const KEY = 'k';\n",
+        ),
+        (
+            "src/index.ts",
+            "import { EMPTY, C, KEY } from './a';\n\
+             export function g(xs: any[]) { const [x, y = EMPTY] = xs; return [x, y]; }\n\
+             export function h(o: any) { const { z = C } = o; return z; }\n\
+             export function k(o: any) { const { [KEY]: v } = o; return v; }\n",
+        ),
+    ]);
+}
+
+#[test]
+fn a_method_does_not_shadow_a_same_named_import() {
+    // `warn(m)` inside `Ctx.warn` calls the imported function, not the method itself.
+    no_dead(&[
+        ("package.json", r#"{"main": "src/index.ts"}"#),
+        ("src/warn.ts", "export function warn(m: string): void {}\n"),
+        (
+            "src/index.ts",
+            "import { warn } from './warn';\n\
+             export class Ctx { warn(m: string): void { warn(m); } }\n\
+             new Ctx().warn('x');\n",
+        ),
+    ]);
+}
+
+#[test]
+fn same_named_methods_on_different_classes_keep_their_own_edges() {
+    // Both `run` methods call a different helper; each must be attributed to its own class.
+    no_dead(&[
+        ("package.json", r#"{"main": "src/index.ts"}"#),
+        (
+            "src/index.ts",
+            "function a(): void {}\nfunction b(): void {}\n\
+             class A { run(): void { a(); } }\nclass B { run(): void { b(); } }\n\
+             new A().run();\nnew B().run();\n",
+        ),
+    ]);
+}
+
+#[test]
+fn proxy_traps_and_computed_members_are_never_dead() {
+    no_dead(&[
+        ("package.json", r#"{"main": "src/index.ts"}"#),
+        (
+            "src/index.ts",
+            "export enum Flags { IS_REF = '__v_isRef' }\n\
+             class Handler implements ProxyHandler<object> {\n\
+               deleteProperty(t: object, k: string) { return true }\n\
+               ownKeys(t: object) { return [] }\n\
+             }\n\
+             class Ref { readonly [Flags.IS_REF] = true }\n\
+             export const p = new Proxy({}, new Handler());\n\
+             export const r = new Ref();\n",
+        ),
+    ]);
+}
+
+#[test]
+fn an_unused_enum_member_is_still_caught() {
+    assert_eq!(
+        dead(&[
+            ("package.json", r#"{"main": "src/index.ts"}"#),
+            (
+                "src/index.ts",
+                "enum C { Used = 1, Unused = 2 }\nexport const x = C.Used;\n",
+            ),
+        ]),
+        vec!["C.Unused".to_string()]
+    );
+}

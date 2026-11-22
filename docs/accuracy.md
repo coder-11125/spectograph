@@ -26,7 +26,10 @@ change is a regression signal even when the test suite is green.
    never special-case the repo.
 3. If it is genuinely unused: it is a true positive — note it, move on.
 
-Bugs found this way so far (most recent first): tsconfig `include: ["."]`/`"./x"` matched
+Bugs found this way so far (most recent first): destructuring defaults in declarations
+(`const [x, y = D] = xs`) not counted as uses; a class method's name shadowing a same-named
+import/function (`warn(...)` inside `Ctx.warn` resolved to the method); `ProxyHandler` traps and
+computed-key members (`[Flags.IS_REF] = true`) reported dead; tsconfig `include: ["."]`/`"./x"` matched
 nothing, dropping every `.ts` file of a nested project (vuejs/core `packages-private`);
 files excluded by the root tsconfig but included by a nested one were dropped; undeclared attrs
 and native listeners on components reported as Vue mismatches (fallthrough); `defineModel()`
@@ -47,16 +50,21 @@ imports linking to an unrelated same-named `import` in the target module.
 | shadcn-ui/taxonomy | typescript | 1268 | 97 | 0 | 3 | 0.4s |
 | mutoe/vue3-realworld-example-app | typescript | 800 | 5 | 0 | 5 | 0.8s |
 | gothinkster/react-redux-realworld-example-app | javascript | 452 | 0 | 0 | 0 | 0.1s |
-| vuejs/core | typescript | 10179 | 13 | 0 | 32 | 1.8s |
+| vuejs/core | typescript | 10179 | 1 | 0 | 32 | 1.8s |
 | facebook/react | javascript | 32290 | 3763 | 174 | 227 | 32.2s |
 
-The two Vue rows were re-measured after the Vue-completeness work (different machine state, so
-the times aren't comparable to the other rows); the others are from the earlier run. Of
-vue3-realworld's 5 🔴, the 3 `playwright/` page-object methods were checked and are genuinely
-unused (defined, never called); the 2 `HttpClient` methods in `src/services/api.ts` were not
-audited. vuejs/core's remaining 13 are unused imports/members, also not audited. Both repos
-report 0 Vue diagnostics. The `playwright/` files only appear because a nested `tsconfig.json`
-now correctly brings them into the analysis.
+The two Vue rows were re-measured after the Vue-completeness work and the audit below
+(different machine state, so the times aren't comparable to the other rows); the others are
+from the earlier run. Both report 0 Vue diagnostics.
+
+**Audit of every remaining 🔴 on the two Vue repos.** vue3-realworld's 5 are all true
+positives: 3 unused `playwright/` page-object methods and 2 unused `HttpClient` methods
+(`addQueryParams`, `abortRequest`; no reference anywhere in the repo). vuejs/core was 13
+before the audit: 12 were false positives, now fixed (4 imports used only as destructuring
+defaults or inside a same-named method, 2 `ProxyHandler` traps, 6 computed-key members); the
+1 left, `CharCodes.LeftParen` in `cssVars.ts`, is a genuinely unused enum member. The
+`playwright/` files only appear because a nested `tsconfig.json` now correctly brings them
+into the analysis.
 
 Notes: taxonomy's 97 are dominated by shadcn/ui component files that no page imports (their
 own imports are then dead too) — plausible true positives, not individually audited. The

@@ -81,6 +81,7 @@ Conventions used everywhere in resolution code:
   `<style scoped>` class diagnostic, deliberately conservative -- it skips anything it can't
   enumerate). Type-aware resolution lives in
   `spectograph-tsserver`.
+- **Class methods are never declared by name in a scope.** `Scopes.members` (keyed by the method node's start byte) is how `resolve_def_id` finds a method's own symbol; declaring the name would shadow a same-named import/function. `implicit.rs` also treats computed-key members (`[Flags.X]`) as always used, and `ProxyHandler` traps as used in files that mention `ProxyHandler`/`new Proxy`.
 - **Parallel parsing (JS/TS).** Pass 1 parses files via `spectograph_analyzer::parallel::par_map`
   (rayon, 32 MiB worker stacks since tree walks are recursive, sequential below 16 files) with
   file-local ids (module = 0, members from 1), then `FileResult::shift_ids` (`shift.rs` in each

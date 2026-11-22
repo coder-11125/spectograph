@@ -17,13 +17,24 @@ enum Binding {
 #[derive(Default)]
 struct Scopes {
     stack: Vec<HashMap<String, Binding>>,
+    /// Class-method symbols keyed by the method node's start byte. Methods are properties,
+    /// not bindings, so they must never be declared by name in a scope (that would shadow
+    /// a same-named import or function and misattribute calls to it); this is how
+    /// `resolve_def_id` still finds a method's own symbol while walking its body.
+    members: HashMap<usize, SymbolId>,
 }
 
 impl Scopes {
     fn new() -> Self {
-        let mut s = Self { stack: Vec::new() };
+        let mut s = Self {
+            stack: Vec::new(),
+            members: HashMap::new(),
+        };
         s.push();
         s
+    }
+    fn declare_member(&mut self, start_byte: usize, id: SymbolId) {
+        self.members.insert(start_byte, id);
     }
     fn push(&mut self) {
         self.stack.push(HashMap::new());
@@ -423,7 +434,7 @@ fn collect_globals(
                                         let full_name = format!("{}.{}", name, method_name);
                                         let method_id = *next_id;
                                         *next_id += 1;
-                                        scopes.declare(&method_name, Binding::Global(method_id));
+                                        scopes.declare_member(member.start_byte(), method_id);
                                         symbols.push(symbol(
                                             method_id,
                                             &full_name,
@@ -1484,6 +1495,9 @@ fn walk_node(
                     if let Some(value) = declarator.child_by_field_name("value") {
                         walk_node(value, src, enclosing, scopes, refs);
                     }
+                    if let Some(name_node) = declarator.child_by_field_name("name") {
+                        walk_pattern_defaults(name_node, src, enclosing, scopes, refs);
+                    }
                     if in_function {
                         if let Some(name_node) = declarator.child_by_field_name("name") {
                             bind_locals(name_node, src.as_bytes(), scopes);
@@ -1553,7 +1567,53 @@ fn walk_node(
     }
 }
 
+/// Walk the *expressions* inside a declarator's binding pattern: `const { a = DEFAULT } = o`
+/// and `const [x, y = DEFAULT] = xs` use `DEFAULT`, and `{ [KEY]: v }` uses `KEY`. The
+/// bound names themselves are declarations, not uses, so they are not walked.
+fn walk_pattern_defaults(
+    pattern: Node,
+    src: &str,
+    enclosing: SymbolId,
+    scopes: &mut Scopes,
+    refs: &mut Vec<UnresolvedRef>,
+) {
+    match pattern.kind() {
+        "assignment_pattern" | "object_assignment_pattern" => {
+            if let Some(right) = pattern.child_by_field_name("right") {
+                walk_node(right, src, enclosing, scopes, refs);
+            }
+            if let Some(left) = pattern.child_by_field_name("left") {
+                walk_pattern_defaults(left, src, enclosing, scopes, refs);
+            }
+        }
+        "pair_pattern" => {
+            if let Some(key) = pattern.child_by_field_name("key") {
+                if key.kind() == "computed_property_name" {
+                    walk_node(key, src, enclosing, scopes, refs);
+                }
+            }
+            if let Some(value) = pattern.child_by_field_name("value") {
+                walk_pattern_defaults(value, src, enclosing, scopes, refs);
+            }
+        }
+        "object_pattern" | "array_pattern" | "rest_pattern" => {
+            let mut c = pattern.walk();
+            for child in pattern.named_children(&mut c) {
+                walk_pattern_defaults(child, src, enclosing, scopes, refs);
+            }
+        }
+        _ => {}
+    }
+}
+
 fn resolve_def_id(node: Node, src: &str, scopes: &Scopes, enclosing: SymbolId) -> SymbolId {
+    if node.kind() == "method_definition" {
+        return scopes
+            .members
+            .get(&node.start_byte())
+            .copied()
+            .unwrap_or(enclosing);
+    }
     node.child_by_field_name("name")
         .and_then(|n| scopes.resolve(node_text(n, src.as_bytes())))
         .and_then(|b| match b {

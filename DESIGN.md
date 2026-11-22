@@ -17,7 +17,8 @@ loop that refactors a codebase lean — verified by the project's own smoke test
       `require.context`, Vue 2 (`Vue.extend`, `new Vue({ el })`, mixins), `defineComponent`,
       `defineEmits<T>()` type forms, directive modifiers, unused `<style scoped>` classes
       `defineModel`, `resolveComponent`, fallthrough-aware mismatch checks; validated on
-      vue3-realworld and vuejs/core (remaining limits: `vue.rs` module doc)
+      vue3-realworld and vuejs/core, with every remaining 🔴 audited (vuejs/core 26 → 1, a true
+      positive; remaining limits: `vue.rs` module doc)
 - [x] Accuracy benchmark on real repos (`scripts/bench.py`, `docs/accuracy.md`)
 - [x] CI + release workflows (written; **not yet verified on GitHub / Windows**)
 - [ ] `fix` agent loop, worktree isolation, smoke/CI gate (currently exits 2)

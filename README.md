@@ -26,8 +26,9 @@ Implemented:
 - **Resolution:** CommonJS and ESM, `tsconfig`/`jsconfig` `paths`/`baseUrl`/`extends`,
   `package.json` `imports`, workspace packages, `@/`-style aliases, TS `./x.js`→`x.ts`,
   `node_modules` entries, `browser` field remapping, tsconfig `include`/`exclude`.
-- **Precision:** type refs, heritage clauses, default params, shorthand properties, member
-  access, implicit uses (constructors, lifecycle hooks, externally-extended classes).
+- **Precision:** type refs, heritage clauses, default params, destructuring defaults,
+  shorthand properties, member access, implicit uses (constructors, lifecycle hooks,
+  externally-extended classes, `ProxyHandler` traps, computed-key members).
 - **Frameworks** (additive on the same parse pass): React (components, JSX, hooks, prop
   mismatches), Angular (decorators, templates, DI, binding mismatches), Vue (SFCs, template
   usage and script bindings, prop/emit mismatches, route components, file-based routing

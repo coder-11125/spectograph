@@ -47,6 +47,24 @@ const ALWAYS_IMPLICIT: &[&str] = &[
     "ngAfterViewChecked",
 ];
 
+/// `ProxyHandler` traps the runtime calls when a class instance is used as a proxy handler.
+/// Only applied in files that mention `ProxyHandler` or `new Proxy`.
+const PROXY_TRAPS: &[&str] = &[
+    "get",
+    "set",
+    "has",
+    "deleteProperty",
+    "defineProperty",
+    "ownKeys",
+    "getOwnPropertyDescriptor",
+    "getPrototypeOf",
+    "setPrototypeOf",
+    "isExtensible",
+    "preventExtensions",
+    "apply",
+    "construct",
+];
+
 /// Members React calls on a class that extends `Component`/`PureComponent`.
 const REACT_LIFECYCLE: &[&str] = &[
     "render",
@@ -234,18 +252,27 @@ pub fn add_implicit_edges(program: &mut Program, sources: &[(PathBuf, String)]) 
             continue;
         };
 
+        // Proxy traps are invoked by the runtime on the proxy, never called by name.
+        let proxy_file = src.contains("ProxyHandler") || src.contains("new Proxy");
+
         for class in symbols
             .iter()
             .filter(|s| s.kind == SymbolKind::Class && !s.name.contains('.'))
         {
             let prefix = format!("{}.", class.name);
             let base = classify_base(class.id, &raw_base, &class_by_name);
-            for member in symbols
-                .iter()
-                .filter(|s| s.name.starts_with(&prefix) && !s.name[prefix.len()..].contains('.'))
-            {
+            for member in symbols.iter().filter(|s| {
+                s.name.starts_with(&prefix)
+                    && (!s.name[prefix.len()..].contains('.')
+                        // `[Flags.IS_REF]`: a computed key legitimately contains dots.
+                        || s.name[prefix.len()..].starts_with('['))
+            }) {
                 let short = &member.name[prefix.len()..];
-                let implicit = ALWAYS_IMPLICIT.contains(&short)
+                // A computed member name (`[ReactiveFlags.IS_REF] = true`) is only known at
+                // runtime, so any `x[key]` access may reach it: never prove it dead.
+                let implicit = short.starts_with('[')
+                    || ALWAYS_IMPLICIT.contains(&short)
+                    || (proxy_file && PROXY_TRAPS.contains(&short))
                     || match base {
                         Base::External => true,
                         Base::ReactComponent => REACT_LIFECYCLE.contains(&short),
